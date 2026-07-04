@@ -105,6 +105,17 @@ fn preview_selection_mirrors_to_editor() {
         harness.run();
     }
 
+    // show the F12 diagnostics overlay in the saved screenshot
+    harness.input_mut().events.push(egui::Event::Key {
+        key: egui::Key::F12,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.run();
+    harness.run();
+
     let mirrored = harness.state().debug_editor_mirror();
     println!("editor mirror range: {mirrored:?}");
     if let Some((a, b)) = mirrored {

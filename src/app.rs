@@ -160,6 +160,13 @@ pub struct App {
     // preview→editor mirror: source char range to glow in the editor
     editor_mirror_range: Option<(usize, usize)>,
 
+    // F12 diagnostics overlay: per-frame trace of what each mirror direction
+    // did (or why it bailed), so failures on real machines are identifiable
+    // from a single screenshot instead of guesswork
+    show_diag: bool,
+    diag_e2p: String,
+    diag_p2e: String,
+
     // disk change watching
     disk_mtime: Option<SystemTime>,
     last_disk_check: Instant,
@@ -226,6 +233,9 @@ impl App {
             preview_layer: None,
             mirror_shape: None,
             editor_mirror_range: None,
+            show_diag: false,
+            diag_e2p: String::new(),
+            diag_p2e: String::new(),
             preview_rect: egui::Rect::NOTHING,
             editor_rect: egui::Rect::NOTHING,
             pending_editor_events: Vec::new(),
@@ -895,6 +905,12 @@ impl App {
                 ui.label(egui::RichText::new("● modified").small().color(ui.visuals().warn_fg_color));
             }
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                        .small()
+                        .weak(),
+                );
+                ui.separator();
                 ui.label(egui::RichText::new(self.mode.label()).small());
                 ui.separator();
                 ui.label(egui::RichText::new("UTF-8").small());
@@ -916,8 +932,9 @@ impl App {
     /// strip Markdown syntax from the selected source, then find and tint the
     /// matching rendered text by scanning this frame's painted galleys.
     /// Paint-only — it never affects what a copy on either side produces.
-    fn mirror_selection(&self, ctx: &egui::Context) {
+    fn mirror_selection(&mut self, ctx: &egui::Context) {
         if !(self.prefs.sync_scroll && self.mode == Mode::Split) {
+            self.diag_e2p = "off: sync disabled or not split".into();
             return;
         }
         // only while the user is actively working in the editor — otherwise a
@@ -925,6 +942,7 @@ impl App {
         // things on the preview side (labels never take keyboard focus, so
         // also stand down whenever the preview has its own live selection)
         if !ctx.memory(|m| m.has_focus(self.editor_id())) {
+            self.diag_e2p = "idle: editor not focused".into();
             return;
         }
         if ctx
@@ -932,11 +950,16 @@ impl App {
             .lock()
             .has_selection()
         {
+            self.diag_e2p = "yield: preview has its own selection".into();
             return;
         }
-        let Some(r) = self.cursor_char_range(ctx) else { return };
+        let Some(r) = self.cursor_char_range(ctx) else {
+            self.diag_e2p = "idle: no editor cursor state".into();
+            return;
+        };
         let (a, b) = (r.primary.index.0.min(r.secondary.index.0), r.primary.index.0.max(r.secondary.index.0));
         if a == b {
+            self.diag_e2p = "idle: editor selection empty".into();
             return;
         }
         let (ba, bb) = (char_to_byte(&self.text, a), char_to_byte(&self.text, b));
@@ -949,10 +972,17 @@ impl App {
             .take(50)
             .collect();
         if segments.is_empty() {
+            self.diag_e2p = "idle: no usable segments in selection".into();
             return;
         }
-        let Some(layer) = self.preview_layer else { return };
-        let Some((shape_idx, clip)) = self.mirror_shape else { return };
+        let Some(layer) = self.preview_layer else {
+            self.diag_e2p = "error: preview layer unknown".into();
+            return;
+        };
+        let Some((shape_idx, clip)) = self.mirror_shape else {
+            self.diag_e2p = "error: no reserved shape slot".into();
+            return;
+        };
 
         // Collect the preview's galleys in paint (reading) order and flatten
         // them into one char stream; galley boundaries count as whitespace.
@@ -975,8 +1005,16 @@ impl App {
         let color = ctx.global_style().visuals.selection.bg_fill.gamma_multiply(0.55);
         let mut shapes: Vec<egui::Shape> = Vec::new();
         let mut from = 0;
+        let mut matched = 0usize;
+        let mut first_fail: Option<String> = None;
         for seg in &segments {
-            let Some((s, e)) = find_tolerant(&flat, seg, from) else { continue };
+            let Some((s, e)) = find_tolerant(&flat, seg, from) else {
+                if first_fail.is_none() {
+                    first_fail = Some(seg.iter().take(40).collect());
+                }
+                continue;
+            };
+            matched += 1;
             from = e;
             // group matched flat range by galley
             let mut by_tok: Vec<(usize, usize, usize)> = Vec::new(); // tok, first, last+1
@@ -994,6 +1032,14 @@ impl App {
                 shapes.extend(galley_range_rects(*pos, galley, ca, cb, color));
             }
         }
+        self.diag_e2p = format!(
+            "active: {}/{} segments matched, {} rects, {} galleys{}",
+            matched,
+            segments.len(),
+            shapes.len(),
+            toks.len(),
+            first_fail.map(|f| format!(", first fail: {f:?}")).unwrap_or_default()
+        );
         if !shapes.is_empty() {
             // fill the placeholder reserved before the preview was painted, so
             // the highlight renders *under* the text instead of covering it
@@ -1031,6 +1077,7 @@ impl App {
     fn mirror_preview_to_editor(&mut self, ctx: &egui::Context) {
         self.editor_mirror_range = None;
         if !(self.prefs.sync_scroll && self.mode == Mode::Split) {
+            self.diag_p2e = "off: sync disabled or not split".into();
             return;
         }
         // A live preview selection is the signal that the user is working the
@@ -1044,14 +1091,20 @@ impl App {
             .lock()
             .has_selection()
         {
+            self.diag_p2e = "idle: no preview selection".into();
             return;
         }
-        let Some(layer) = self.preview_layer else { return };
+        let Some(layer) = self.preview_layer else {
+            self.diag_p2e = "error: preview layer unknown".into();
+            return;
+        };
         let sel_color = ctx.global_style().visuals.selection.bg_fill;
 
         // per selected galley: the chars under the selection quads' x-range
+        let galleys = self.collect_preview_galleys(ctx, layer);
+        let galley_count = galleys.len();
         let mut pieces: Vec<Vec<char>> = Vec::new();
-        for (_, galley) in self.collect_preview_galleys(ctx, layer) {
+        for (_, galley) in galleys {
             let mut piece: Vec<char> = Vec::new();
             for placed in &galley.rows {
                 let (mut x0, mut x1) = (f32::INFINITY, f32::NEG_INFINITY);
@@ -1078,6 +1131,10 @@ impl App {
             }
         }
         if pieces.is_empty() {
+            self.diag_p2e = format!(
+                "stuck: selection exists but 0 selection quads found in {galley_count} galleys \
+                 (color mismatch? sel_color={sel_color:?})"
+            );
             return;
         }
 
@@ -1088,7 +1145,14 @@ impl App {
         let mut first = None;
         let mut last = 0;
         for p in &pieces {
-            let Some((s, e)) = find_tolerant(&hay, p, from) else { return };
+            let Some((s, e)) = find_tolerant(&hay, p, from) else {
+                let frag: String = p.iter().take(40).collect();
+                self.diag_p2e = format!(
+                    "stuck: {} pieces from {galley_count} galleys, piece unmatched in source: {frag:?}",
+                    pieces.len()
+                );
+                return;
+            };
             if first.is_none() {
                 first = Some(s);
             }
@@ -1099,6 +1163,18 @@ impl App {
             let src_start = map[s];
             let src_end = map[last - 1] + 1;
             self.editor_mirror_range = Some((src_start, src_end));
+            let shown: String = self
+                .text
+                .chars()
+                .skip(src_start)
+                .take((src_end - src_start).min(40))
+                .collect();
+            self.diag_p2e = format!(
+                "active: {} pieces → source chars {src_start}..{src_end}: {shown:?}",
+                pieces.len()
+            );
+        } else {
+            self.diag_p2e = "stuck: match produced empty range".into();
         }
     }
 
@@ -1324,7 +1400,7 @@ impl App {
                      Ctrl+Shift+S Save As               F5 Revert\n\
                      Ctrl+F Find       Ctrl+H Replace    F3 Find Next\n\
                      Ctrl+1 Plain      Ctrl+2 Pretty     Ctrl+3 Split\n\
-                     Alt+Z Word Wrap   Ctrl+± Zoom",
+                     Alt+Z Word Wrap   Ctrl+± Zoom       F12 Diagnostics",
                 );
                 ui.add_space(10.0);
                 ui.vertical_centered(|ui| {
@@ -1466,6 +1542,73 @@ impl App {
         if ctx.input_mut(|i| i.consume_shortcut(&sc(Modifiers::COMMAND, Key::Y))) {
             self.send_editor_key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
         }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F12)) {
+            self.show_diag = !self.show_diag;
+        }
+    }
+
+    fn diagnostics_text(&self, ctx: &egui::Context) -> String {
+        let has_sel = ctx
+            .plugin::<egui::text_selection::LabelSelectionState>()
+            .lock()
+            .has_selection();
+        let editor_sel = self
+            .cursor_char_range(ctx)
+            .map(|r| {
+                let (a, b) = (
+                    r.primary.index.0.min(r.secondary.index.0),
+                    r.primary.index.0.max(r.secondary.index.0),
+                );
+                format!("{a}..{b}")
+            })
+            .unwrap_or_else(|| "none".into());
+        format!(
+            "NotepadMD+ v{}\n\
+             mode: {} | sync scroll: {} | theme dark: {}\n\
+             zoom: {:.2} | pixels_per_point: {:.2}\n\
+             doc: {} chars | wrap: {} | line numbers: {}\n\
+             editor focused: {} | editor selection (chars): {}\n\
+             preview selection (egui): {}\n\
+             editor→preview: {}\n\
+             preview→editor: {}",
+            env!("CARGO_PKG_VERSION"),
+            self.mode.label(),
+            self.prefs.sync_scroll,
+            ctx.theme() == egui::Theme::Dark,
+            ctx.zoom_factor(),
+            ctx.pixels_per_point(),
+            self.text.chars().count(),
+            self.prefs.word_wrap,
+            self.prefs.line_numbers,
+            ctx.memory(|m| m.has_focus(self.editor_id())),
+            editor_sel,
+            has_sel,
+            self.diag_e2p,
+            self.diag_p2e,
+        )
+    }
+
+    fn diagnostics_overlay(&mut self, ctx: &egui::Context) {
+        if !self.show_diag {
+            return;
+        }
+        let text = self.diagnostics_text(ctx);
+        egui::Window::new("Diagnostics (F12)")
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 40.0))
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                ui.monospace(&text);
+                ui.horizontal(|ui| {
+                    if ui.button("Copy diagnostics").clicked() {
+                        ctx.copy_text(text.clone());
+                    }
+                    if ui.button("Close").clicked() {
+                        self.show_diag = false;
+                    }
+                });
+            });
     }
 
     fn poll_disk(&mut self) {
@@ -1620,6 +1763,7 @@ impl eframe::App for App {
 
         self.mirror_selection(ctx);
         self.mirror_preview_to_editor(ctx);
+        self.diagnostics_overlay(ctx);
         self.context_menu(ctx);
         self.modals(ctx);
     }
