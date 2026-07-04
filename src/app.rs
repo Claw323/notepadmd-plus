@@ -73,6 +73,20 @@ enum MenuSide {
     Preview,
 }
 
+#[derive(Clone, Copy)]
+enum MenuAction {
+    Undo,
+    Redo,
+    Cut,
+    EditorCopy,
+    Paste,
+    Delete,
+    SelectAll,
+    PreviewCopy,
+    CopyAll,
+    EditPlain,
+}
+
 /// An action deferred behind the "unsaved changes" confirmation.
 #[derive(Clone)]
 enum Pending {
@@ -117,6 +131,12 @@ pub struct App {
     ctx_menu_opened: bool, // opened this frame; skip the dismiss check once
     ctx_menu_can_paste: bool,
     pending_context_click: Option<egui::Pos2>, // secondary click captured in raw_input_hook
+    // menu rows are hit-tested by hand: clicks inside the menu are swallowed in
+    // raw_input_hook so egui's selection plugins never see them (keeps text
+    // highlights alive through a menu click, like native Windows menus)
+    menu_rect: egui::Rect,
+    menu_rows: Vec<(egui::Rect, MenuAction, bool)>,
+    pending_menu_click: Option<egui::Pos2>,
     preview_rect: egui::Rect, // last frame's preview area, for hit-testing clicks
     editor_rect: egui::Rect,  // last frame's editor area
     // editor events (undo/cut/paste…) queued by menus, replayed at frame start
@@ -177,6 +197,9 @@ impl App {
             ctx_menu_opened: false,
             ctx_menu_can_paste: false,
             pending_context_click: None,
+            menu_rect: egui::Rect::NOTHING,
+            menu_rows: Vec::new(),
+            pending_menu_click: None,
             preview_rect: egui::Rect::NOTHING,
             editor_rect: egui::Rect::NOTHING,
             pending_editor_events: Vec::new(),
@@ -782,85 +805,120 @@ impl App {
         });
     }
 
+    fn run_menu_action(&mut self, action: MenuAction, ctx: &egui::Context) {
+        match action {
+            MenuAction::Undo => self.send_editor_key(Key::Z, Modifiers::COMMAND),
+            MenuAction::Redo => self.send_editor_key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT),
+            MenuAction::Cut => self.send_editor_event(egui::Event::Cut),
+            MenuAction::EditorCopy => self.send_editor_event(egui::Event::Copy),
+            MenuAction::Paste => {
+                if let Ok(t) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+                    self.send_editor_event(egui::Event::Paste(t));
+                }
+            }
+            MenuAction::Delete => self.send_editor_key(Key::Delete, Modifiers::NONE),
+            MenuAction::SelectAll => {
+                let n = self.text.chars().count();
+                self.select_range(ctx, 0, n);
+            }
+            // injected now (frame start): the labels render later this frame
+            // and egui's selection plugin performs the actual copy
+            MenuAction::PreviewCopy => ctx.input_mut(|i| i.events.push(egui::Event::Copy)),
+            MenuAction::CopyAll => ctx.copy_text(self.text.clone()),
+            MenuAction::EditPlain => self.mode = Mode::Plain,
+        }
+    }
+
     fn context_menu(&mut self, ctx: &egui::Context) {
-        let Some((pos, side)) = self.ctx_menu else { return };
+        let Some((pos, side)) = self.ctx_menu else {
+            self.menu_rect = egui::Rect::NOTHING;
+            self.menu_rows.clear();
+            return;
+        };
+        // None = separator. Rows are painted by hand and hit-tested against
+        // clicks swallowed in raw_input_hook, so selecting a menu item never
+        // produces a pointer press that egui could react to.
+        let rows: Vec<Option<(&str, bool, MenuAction)>> = match side {
+            MenuSide::Editor => {
+                // standard Windows edit-control menu
+                let has_sel = self
+                    .cursor_char_range(ctx)
+                    .is_some_and(|r| r.primary.index.0 != r.secondary.index.0);
+                vec![
+                    Some(("Undo", true, MenuAction::Undo)),
+                    Some(("Redo", true, MenuAction::Redo)),
+                    None,
+                    Some(("Cut", has_sel, MenuAction::Cut)),
+                    Some(("Copy", has_sel, MenuAction::EditorCopy)),
+                    Some(("Paste", self.ctx_menu_can_paste, MenuAction::Paste)),
+                    Some(("Delete", has_sel, MenuAction::Delete)),
+                    None,
+                    Some(("Select All", true, MenuAction::SelectAll)),
+                ]
+            }
+            MenuSide::Preview => {
+                let has_sel = ctx
+                    .plugin::<egui::text_selection::LabelSelectionState>()
+                    .lock()
+                    .has_selection();
+                vec![
+                    Some(("Copy", has_sel, MenuAction::PreviewCopy)),
+                    Some(("Copy All (Markdown)", true, MenuAction::CopyAll)),
+                    None,
+                    Some(("Edit in Plain Text", true, MenuAction::EditPlain)),
+                ]
+            }
+        };
+
+        let hover = ctx.input(|i| i.pointer.hover_pos());
+        self.menu_rows.clear();
         let area = egui::Area::new(egui::Id::new("ctx-menu"))
             .fixed_pos(pos)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::menu(ui.style()).show(ui, |ui| {
                     ui.set_min_width(170.0);
-                    let mut close = false;
-                    let mut item = |ui: &mut egui::Ui, enabled: bool, label: &str| {
-                        let clicked = ui
-                            .add_enabled(enabled, egui::Button::new(label))
-                            .clicked();
-                        close |= clicked;
-                        clicked
-                    };
-                    match side {
-                        MenuSide::Editor => {
-                            // standard Windows edit-control menu
-                            let has_sel = self
-                                .cursor_char_range(ctx)
-                                .is_some_and(|r| r.primary.index.0 != r.secondary.index.0);
-                            if item(ui, true, "Undo") {
-                                self.send_editor_key(Key::Z, Modifiers::COMMAND);
-                            }
-                            if item(ui, true, "Redo") {
-                                self.send_editor_key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
-                            }
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    for row in rows {
+                        let Some((label, enabled, action)) = row else {
                             ui.separator();
-                            if item(ui, has_sel, "Cut") {
-                                self.send_editor_event(egui::Event::Cut);
-                            }
-                            if item(ui, has_sel, "Copy") {
-                                self.send_editor_event(egui::Event::Copy);
-                            }
-                            if item(ui, self.ctx_menu_can_paste, "Paste") {
-                                if let Ok(t) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-                                    self.send_editor_event(egui::Event::Paste(t));
-                                }
-                            }
-                            if item(ui, has_sel, "Delete") {
-                                self.send_editor_key(Key::Delete, Modifiers::NONE);
-                            }
-                            ui.separator();
-                            if item(ui, true, "Select All") {
-                                let n = self.text.chars().count();
-                                self.select_range(ctx, 0, n);
-                            }
+                            continue;
+                        };
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width().max(170.0), 24.0),
+                            egui::Sense::hover(),
+                        );
+                        if enabled && hover.is_some_and(|p| rect.contains(p)) {
+                            ui.painter().rect_filled(
+                                rect,
+                                4.0,
+                                ui.visuals().widgets.hovered.weak_bg_fill,
+                            );
                         }
-                        MenuSide::Preview => {
-                            let has_selection = ctx
-                                .plugin::<egui::text_selection::LabelSelectionState>()
-                                .lock()
-                                .has_selection();
-                            // the selected text was already copied when the menu
-                            // opened (see update()); this item just confirms it
-                            item(ui, has_selection, "Copy");
-                            if item(ui, true, "Copy All (Markdown)") {
-                                ctx.copy_text(self.text.clone());
-                            }
-                            ui.separator();
-                            if item(ui, true, "Edit in Plain Text") {
-                                self.mode = Mode::Plain;
-                            }
-                        }
-                    }
-                    if close {
-                        self.ctx_menu = None;
+                        let color = if enabled {
+                            ui.visuals().text_color()
+                        } else {
+                            ui.visuals().weak_text_color()
+                        };
+                        ui.painter().text(
+                            rect.left_center() + egui::vec2(8.0, 0.0),
+                            egui::Align2::LEFT_CENTER,
+                            label,
+                            egui::FontId::proportional(14.0),
+                            color,
+                        );
+                        self.menu_rows.push((rect, action, enabled));
                     }
                 });
             });
+        self.menu_rect = area.response.rect;
+
         if self.ctx_menu_opened {
             self.ctx_menu_opened = false;
         } else {
-            let dismiss = ctx.input(|i| {
-                i.key_pressed(Key::Escape)
-                    || (i.pointer.any_pressed()
-                        && !i.pointer.interact_pos().is_some_and(|p| area.response.rect.contains(p)))
-            });
+            // clicks inside the menu never reach egui, so any press seen here
+            // is outside the menu → dismiss (as does Escape)
+            let dismiss = ctx.input(|i| i.key_pressed(Key::Escape) || i.pointer.any_pressed());
             if dismiss {
                 self.ctx_menu = None;
             }
@@ -1175,16 +1233,26 @@ impl eframe::App for App {
             ctx.input_mut(|i| i.events.extend(events));
         }
 
+        // Menu row clicked last frame (the click itself was swallowed in
+        // raw_input_hook, so no selection anywhere was disturbed). Run the
+        // action now, before panels render, so injected events land this frame.
+        if let Some(p) = self.pending_menu_click.take() {
+            let action = self
+                .menu_rows
+                .iter()
+                .find(|(r, _, enabled)| *enabled && r.contains(p))
+                .map(|(_, a, _)| *a);
+            if let Some(a) = action {
+                self.ctx_menu = None;
+                self.run_menu_action(a, ctx);
+            } // clicking a disabled row or padding keeps the menu open, like Windows
+        }
+
         // Right-click (captured and swallowed in raw_input_hook so selections
-        // survive it, as in native Windows apps): open the matching context
-        // menu. For the preview, also inject a Copy event *now*, before the
-        // labels render — egui's label selection only honors Copy while it
-        // processes the labels, and any later click (e.g. on a menu button)
-        // clears the selection. No-op when nothing is selected.
+        // survive it, as in native Windows apps): open the matching context menu.
         if let Some(pos) = self.pending_context_click.take() {
             if !self.any_modal_open() {
                 if self.mode != Mode::Plain && self.preview_rect.contains(pos) {
-                    ctx.input_mut(|i| i.events.push(egui::Event::Copy));
                     self.ctx_menu = Some((pos, MenuSide::Preview));
                     self.ctx_menu_opened = true;
                 } else if self.mode != Mode::Pretty && self.editor_rect.contains(pos) {
@@ -1231,21 +1299,34 @@ impl eframe::App for App {
     /// "right-click the highlight → Copy" works). We capture the position and
     /// open our own context menu in update() instead.
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        raw_input.events.retain(|e| {
-            if let egui::Event::PointerButton {
+        let menu_rect = if self.ctx_menu.is_some() { self.menu_rect } else { egui::Rect::NOTHING };
+        raw_input.events.retain(|e| match e {
+            egui::Event::PointerButton {
                 button: egui::PointerButton::Secondary,
                 pressed,
                 pos,
                 ..
-            } = e
-            {
+            } => {
                 if !pressed {
                     self.pending_context_click = Some(*pos);
                 }
                 false
-            } else {
-                true
             }
+            // Clicks on the open context menu are swallowed too and hit-tested
+            // by hand in update(): if egui saw the press, its selection plugin
+            // would clear the preview highlight before the action runs.
+            egui::Event::PointerButton {
+                button: egui::PointerButton::Primary,
+                pressed,
+                pos,
+                ..
+            } if menu_rect.contains(*pos) => {
+                if !pressed {
+                    self.pending_menu_click = Some(*pos);
+                }
+                false
+            }
+            _ => true,
         });
     }
 
