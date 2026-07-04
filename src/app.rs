@@ -2021,8 +2021,6 @@ fn strip_md_mapped(src: &str) -> (String, Vec<usize>) {
     let mut map: Vec<usize> = Vec::with_capacity(src.len());
     let mut in_fence = false;
     let mut line_start = 0usize; // char index of current line start in src
-    let mut prev_blank = true; // preceding line blank (or start of selection)
-    let mut prev_list = false; // preceding line was a list item
     for line in src.split_inclusive('\n') {
         let line_chars = line.chars().count();
         let body = line.trim_end_matches(['\n', '\r']);
@@ -2054,7 +2052,6 @@ fn strip_md_mapped(src: &str) -> (String, Vec<usize>) {
                 push(&mut out, &mut map, '\n', line_start);
             }
             line_start += line_chars;
-            prev_blank = true;
             continue;
         }
 
@@ -2073,21 +2070,23 @@ fn strip_md_mapped(src: &str) -> (String, Vec<usize>) {
             off += t.chars().count() - rest.chars().count();
             t = rest;
         }
-        // CommonMark: an ordered item can only interrupt a paragraph if it
-        // starts with "1." — otherwise a "4." after a text line stays literal
-        // text in the rendered output and must stay in the needle too
-        let mut is_list_item = false;
+        // Ordered numbers are ALWAYS visible in the rendered output — as a
+        // list item's number label, or as literal text when the line is a
+        // paragraph continuation — so they stay in the needle. Bullets render
+        // as dots (not text) and are dropped.
         if let Some(n) = crate::highlight::list_marker_len(t) {
             let ordered = t.starts_with(|c: char| c.is_ascii_digit());
-            let can_start = !ordered || prev_blank || prev_list || t.starts_with("1. ");
-            if can_start {
-                off += t[..n].chars().count();
-                t = &t[n..];
-                is_list_item = true;
+            if ordered {
+                // keep "N." in the needle, consume it from `t`
+                let num_len = t[..n].trim_end().len(); // "N." without the space
+                for (i, c) in t[..num_len].chars().enumerate() {
+                    push(&mut out, &mut map, c, line_start + off + i);
+                }
+                push(&mut out, &mut map, ' ', line_start + off + num_len);
             }
+            off += t[..n].chars().count();
+            t = &t[n..];
         }
-        prev_list = is_list_item;
-        prev_blank = false;
         // inline markers
         let mut chars = t.chars().enumerate().peekable();
         while let Some((i, c)) = chars.next() {
@@ -2285,20 +2284,20 @@ mod tests {
         let src = "## Head\n\n2. **Back up** the `DB` now:\n> quoted *text*\n\nSee [docs](http://x) here.";
         assert_eq!(
             strip_md(src),
-            "Head\nBack up the DB now: quoted text\nSee docs here."
+            "Head\n2. Back up the DB now: quoted text\nSee docs here."
         );
         // fenced code kept verbatim
         assert_eq!(strip_md("```rs\nlet x = 1;\n```"), "let x = 1;");
-        // an ordered marker other than "1." can't interrupt a paragraph, so
-        // the renderer keeps it as literal text — the needle must too
+        // ordered numbers are always visible in the rendered output — as the
+        // item's number label or as literal paragraph text — so they stay
         assert_eq!(
             strip_md("Before deploying:\n4. `npm run build` must pass.\n5. Verify."),
             "Before deploying: 4. npm run build must pass. 5. Verify."
         );
-        // ...but after a blank line it is a real list item and gets stripped
-        assert_eq!(strip_md("Steps:\n\n4. build it\n5. ship it"), "Steps:\nbuild it ship it");
-        // and "1." may interrupt a paragraph
-        assert_eq!(strip_md("Steps:\n1. build it"), "Steps: build it");
+        assert_eq!(strip_md("Steps:\n\n4. build it\n5. ship it"), "Steps:\n4. build it 5. ship it");
+        assert_eq!(strip_md("Steps:\n1. build it"), "Steps: 1. build it");
+        // bullets render as dots, not text — they are dropped
+        assert_eq!(strip_md("- alpha\n- beta"), "alpha beta");
     }
 
     #[test]

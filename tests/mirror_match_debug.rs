@@ -45,6 +45,23 @@ is running — do NOT just `cp` a live DB): it doesn't lock 'readers' at all.
 
 An unpaired backtick ` stays literal, and so does a stray * star. Don't
 forget curly quotes: it’s ‘fine’ to paste “smart” text from chat tools.
+
+**Before starting ANY fix:**
+1. `git status` — confirm a clean tree; create a dedicated branch:
+   `git checkout -b fix/<short-name>` (never commit to `main`).
+2. **Back up every SQLite DB** using SQLite's online backup (safe while the app
+   is running — do NOT just `cp` a live DB):
+   ```bash
+   TS=$(date +%Y%m%d-%H%M%S)
+   mkdir -p ~/mc-backups/$TS
+   for db in src/data/auth/auth.sqlite \
+             src/data/helpdesk/helpdesk.sqlite; do
+     [ -f "$db" ] && sqlite3 "$db" ".backup '$HOME/mc-backups/$TS/$(basename $db)'"
+   done
+   # also grab the llm-costs DB — confirm its path from src/app/api/llm-costs/route.ts first
+   ls -la ~/mc-backups/$TS
+   ```
+3. Note the current commit: `git rev-parse HEAD` (write it down for rollback).
 "#;
 
 #[test]
