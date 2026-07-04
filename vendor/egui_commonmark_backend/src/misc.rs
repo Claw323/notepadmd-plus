@@ -342,9 +342,11 @@ impl CodeBlock {
             .map(syntect_color_to_egui)
             .unwrap_or(style.visuals.extreme_bg_color);
 
-        if let Some(color) = curr_theme.settings.selection_foreground {
-            style.visuals.selection.bg_fill = syntect_color_to_egui(color);
-        }
+        // NotepadMD+ patch: keep the app-wide selection color inside code
+        // blocks too — selections look consistent, and the app can recognize
+        // selection quads in the painted meshes by their single known color.
+        // (Upstream overrode selection.bg_fill with the syntect theme's
+        // selection_foreground here.)
     }
 
     fn syntax_highlighting(

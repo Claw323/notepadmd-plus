@@ -41,4 +41,4 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
-egui_kittest = { version = "0.35", features = ["snapshot", "wgpu"] }
+egui_kittest = { version = "0.35", features = ["eframe", "snapshot", "wgpu"] }

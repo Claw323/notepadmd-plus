@@ -1,8 +1,7 @@
 // No console window for release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
-mod highlight;
+use notepadmd_plus::app;
 
 fn main() -> eframe::Result {
     let icon = egui::IconData {

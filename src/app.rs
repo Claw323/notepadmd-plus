@@ -157,6 +157,8 @@ pub struct App {
     // placeholder shape reserved before the preview renders; the selection
     // mirror fills it in later so its highlight draws *under* the text
     mirror_shape: Option<(egui::layers::ShapeIdx, egui::Rect)>,
+    // preview→editor mirror: source char range to glow in the editor
+    editor_mirror_range: Option<(usize, usize)>,
 
     // disk change watching
     disk_mtime: Option<SystemTime>,
@@ -223,6 +225,7 @@ impl App {
             pending_preview_offset: None,
             preview_layer: None,
             mirror_shape: None,
+            editor_mirror_range: None,
             preview_rect: egui::Rect::NOTHING,
             editor_rect: egui::Rect::NOTHING,
             pending_editor_events: Vec::new(),
@@ -239,6 +242,29 @@ impl App {
             }
         }
         app
+    }
+
+    /// Test-only hooks for the visual repro harness (tests/).
+    #[doc(hidden)]
+    pub fn debug_setup(&mut self, text: &str, split: bool) {
+        self.text = text.to_owned();
+        self.prefs.line_numbers = true;
+        if split {
+            self.mode = Mode::Split;
+            self.prefs.sync_scroll = true;
+        } else {
+            self.mode = Mode::Plain;
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn debug_editor_id(&self) -> egui::Id {
+        self.editor_id()
+    }
+
+    #[doc(hidden)]
+    pub fn debug_editor_mirror(&self) -> Option<(usize, usize)> {
+        self.editor_mirror_range
     }
 
     // ---------- file operations ----------
@@ -720,6 +746,14 @@ impl App {
         // stable id, so unsalted ScrollAreas collide and clobber each other's
         // scroll state (preview side becomes unscrollable)
         let sout = scroll.id_salt("editor-scroll").auto_shrink([false, false]).show(ui, |ui| {
+            // reserved before the text paints: editor background, then the
+            // preview→editor mirror glow — both must render under the glyphs
+            // (the TextEdit's own background is turned off below, because it
+            // would paint over anything reserved here)
+            let bg_idx = ui.painter().add(egui::Shape::Noop);
+            let mirror_idx = ui.painter().add(egui::Shape::Noop);
+            let mirror_clip = ui.clip_rect();
+            let editor_layer = ui.layer_id();
             ui.horizontal_top(|ui| {
                 let gutter = if self.prefs.line_numbers {
                     let digits = self.text.lines().count().max(1).ilog10() as usize + 1;
@@ -739,6 +773,7 @@ impl App {
                 let editor_id = self.editor_id();
                 let out = egui::TextEdit::multiline(&mut self.text)
                     .id(editor_id)
+                    .background_color(egui::Color32::TRANSPARENT)
                     .font(egui::FontId::monospace(highlight::EDITOR_FONT_SIZE))
                     .code_editor()
                     .lock_focus(true) // Tab inserts a tab character
@@ -753,7 +788,14 @@ impl App {
 
                 // line numbers, aligned to laid-out rows (correct under word wrap)
                 if let Some(gutter_rect) = gutter {
-                    let painter = ui.painter_at(gutter_rect.intersect(ui.clip_rect()));
+                    // clip to the gutter's x-range but the *viewport's* y-range:
+                    // the allocated gutter rect is only one screen tall and
+                    // scrolls away with the content, which used to cut the
+                    // numbers off after the first screenful of lines
+                    let painter = ui.painter_at(egui::Rect::from_x_y_ranges(
+                        gutter_rect.x_range(),
+                        ui.clip_rect().y_range(),
+                    ));
                     let color = ui.visuals().weak_text_color();
                     let font = egui::FontId::monospace(highlight::EDITOR_FONT_SIZE - 2.0);
                     let clip = ui.clip_rect();
@@ -774,6 +816,30 @@ impl App {
                             line_no += 1;
                         }
                         number_next = row.ends_with_newline;
+                    }
+                }
+
+                // repaint the editor background into the reserved slot
+                ui.ctx().graphics_mut(|g| {
+                    g.entry(editor_layer).set(
+                        bg_idx,
+                        mirror_clip,
+                        egui::Shape::rect_filled(
+                            out.response.rect,
+                            0.0,
+                            ui.visuals().text_edit_bg_color(),
+                        ),
+                    );
+                });
+
+                // preview→editor mirror glow (computed at the end of last frame)
+                if let Some((a, b)) = self.editor_mirror_range {
+                    let color = ui.visuals().selection.bg_fill.gamma_multiply(0.55);
+                    let shapes = galley_range_rects(out.galley_pos, &out.galley, a, b, color);
+                    if !shapes.is_empty() {
+                        ui.ctx().graphics_mut(|g| {
+                            g.entry(editor_layer).set(mirror_idx, mirror_clip, egui::Shape::Vec(shapes));
+                        });
                     }
                 }
 
@@ -890,19 +956,7 @@ impl App {
 
         // Collect the preview's galleys in paint (reading) order and flatten
         // them into one char stream; galley boundaries count as whitespace.
-        let mut toks: Vec<(egui::Pos2, std::sync::Arc<egui::Galley>)> = Vec::new();
-        ctx.graphics(|g| {
-            if let Some(list) = g.get(layer) {
-                for cs in list.all_entries() {
-                    if let egui::epaint::Shape::Text(ts) = &cs.shape {
-                        let rect = egui::Rect::from_min_size(ts.pos, ts.galley.size());
-                        if rect.intersects(self.preview_rect) && ts.pos.x >= self.preview_rect.left() - 2.0 {
-                            toks.push((ts.pos, ts.galley.clone()));
-                        }
-                    }
-                }
-            }
-        });
+        let toks = self.collect_preview_galleys(ctx, layer);
         let mut flat: Vec<char> = Vec::new();
         let mut map: Vec<(usize, usize)> = Vec::new(); // flat idx -> (tok, char-in-galley)
         for (ti, (_, g)) in toks.iter().enumerate() {
@@ -937,28 +991,7 @@ impl App {
             }
             for (ti, ca, cb) in by_tok {
                 let (pos, galley) = &toks[ti];
-                let mut cum = 0usize;
-                for placed in &galley.rows {
-                    let n = placed.char_count_including_newline().0;
-                    let visible = placed.char_count_excluding_newline().0;
-                    let (lo, hi) = (ca.max(cum), cb.min(cum + n));
-                    if lo < hi {
-                        // clamp to real glyphs so a trailing newline can't
-                        // produce a rect past the row's text
-                        let col_a = (lo - cum).min(visible);
-                        let col_b = (hi - cum).min(visible);
-                        if col_a < col_b {
-                            let x0 = placed.x_offset(egui::epaint::text::CharIndex(col_a));
-                            let x1 = placed.x_offset(egui::epaint::text::CharIndex(col_b));
-                            let rect = egui::Rect::from_min_max(
-                                *pos + placed.pos.to_vec2() + egui::vec2(x0, 0.0),
-                                *pos + placed.pos.to_vec2() + egui::vec2(x1, placed.row.height()),
-                            );
-                            shapes.push(egui::Shape::rect_filled(rect, 2.0, color));
-                        }
-                    }
-                    cum += n;
-                }
+                shapes.extend(galley_range_rects(*pos, galley, ca, cb, color));
             }
         }
         if !shapes.is_empty() {
@@ -967,6 +1000,102 @@ impl App {
             ctx.graphics_mut(|g| {
                 g.entry(layer).set(shape_idx, clip, egui::Shape::Vec(shapes));
             });
+        }
+    }
+
+    fn collect_preview_galleys(
+        &self,
+        ctx: &egui::Context,
+        layer: egui::LayerId,
+    ) -> Vec<(egui::Pos2, std::sync::Arc<egui::Galley>)> {
+        let mut toks = Vec::new();
+        ctx.graphics(|g| {
+            if let Some(list) = g.get(layer) {
+                for cs in list.all_entries() {
+                    if let egui::epaint::Shape::Text(ts) = &cs.shape {
+                        let rect = egui::Rect::from_min_size(ts.pos, ts.galley.size());
+                        if rect.intersects(self.preview_rect) && ts.pos.x >= self.preview_rect.left() - 2.0 {
+                            toks.push((ts.pos, ts.galley.clone()));
+                        }
+                    }
+                }
+            }
+        });
+        toks
+    }
+
+    /// The reverse mirror: reconstruct the preview's selection from the
+    /// painted meshes (egui bakes selection quads into the row meshes with a
+    /// known color), extract the selected rendered text, and locate it in the
+    /// Markdown source. The editor paints the resulting range next frame.
+    fn mirror_preview_to_editor(&mut self, ctx: &egui::Context) {
+        self.editor_mirror_range = None;
+        if !(self.prefs.sync_scroll && self.mode == Mode::Split) {
+            return;
+        }
+        if ctx.memory(|m| m.has_focus(self.editor_id())) {
+            return; // user is working the editor side; other direction applies
+        }
+        if !ctx
+            .plugin::<egui::text_selection::LabelSelectionState>()
+            .lock()
+            .has_selection()
+        {
+            return;
+        }
+        let Some(layer) = self.preview_layer else { return };
+        let sel_color = ctx.global_style().visuals.selection.bg_fill;
+
+        // per selected galley: the chars under the selection quads' x-range
+        let mut pieces: Vec<Vec<char>> = Vec::new();
+        for (_, galley) in self.collect_preview_galleys(ctx, layer) {
+            let mut piece: Vec<char> = Vec::new();
+            for placed in &galley.rows {
+                let (mut x0, mut x1) = (f32::INFINITY, f32::NEG_INFINITY);
+                for v in &placed.row.visuals.mesh.vertices {
+                    if v.uv == egui::epaint::WHITE_UV && v.color == sel_color {
+                        x0 = x0.min(v.pos.x);
+                        x1 = x1.max(v.pos.x);
+                    }
+                }
+                if x0.is_finite() && x1 > x0 {
+                    if !piece.is_empty() {
+                        piece.push(' ');
+                    }
+                    for g in &placed.row.glyphs {
+                        let mid = g.pos.x + g.advance_width * 0.5;
+                        if mid >= x0 - 0.5 && mid <= x1 + 0.5 {
+                            piece.push(g.chr);
+                        }
+                    }
+                }
+            }
+            if piece.iter().any(|c| !c.is_whitespace()) {
+                pieces.push(piece);
+            }
+        }
+        if pieces.is_empty() {
+            return;
+        }
+
+        // find the pieces, in order, in the markdown-stripped source
+        let (stripped, map) = strip_md_mapped(&self.text);
+        let hay: Vec<char> = stripped.chars().collect();
+        let mut from = 0;
+        let mut first = None;
+        let mut last = 0;
+        for p in &pieces {
+            let Some((s, e)) = find_tolerant(&hay, p, from) else { return };
+            if first.is_none() {
+                first = Some(s);
+            }
+            last = e;
+            from = e;
+        }
+        if let (Some(s), true) = (first, last > 0) {
+            let src_start = map[s];
+            let src_end = map[last - 1] + 1;
+            self.editor_mirror_range = Some((src_start, src_end));
         }
     }
 
@@ -1487,6 +1616,7 @@ impl eframe::App for App {
             });
 
         self.mirror_selection(ctx);
+        self.mirror_preview_to_editor(ctx);
         self.context_menu(ctx);
         self.modals(ctx);
     }
@@ -1685,54 +1815,112 @@ fn lift_nested_fences(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// Highlight rects for a char range of a laid-out galley (row-accurate,
+/// clamped to real glyphs so trailing newlines don't produce stray bars).
+fn galley_range_rects(
+    origin: egui::Pos2,
+    galley: &egui::Galley,
+    ca: usize,
+    cb: usize,
+    color: egui::Color32,
+) -> Vec<egui::Shape> {
+    let mut shapes = Vec::new();
+    let mut cum = 0usize;
+    for placed in &galley.rows {
+        let n = placed.char_count_including_newline().0;
+        let visible = placed.char_count_excluding_newline().0;
+        let (lo, hi) = (ca.max(cum), cb.min(cum + n));
+        if lo < hi {
+            let col_a = (lo - cum).min(visible);
+            let col_b = (hi - cum).min(visible);
+            if col_a < col_b {
+                let x0 = placed.x_offset(egui::epaint::text::CharIndex(col_a));
+                let x1 = placed.x_offset(egui::epaint::text::CharIndex(col_b));
+                let rect = egui::Rect::from_min_max(
+                    origin + placed.pos.to_vec2() + egui::vec2(x0, 0.0),
+                    origin + placed.pos.to_vec2() + egui::vec2(x1, placed.row.height()),
+                );
+                shapes.push(egui::Shape::rect_filled(rect, 2.0, color));
+            }
+        }
+        cum += n;
+    }
+    shapes
+}
+
 /// Reduce Markdown source to roughly what the renderer displays: strip
 /// emphasis/code markers, heading/quote/list prefixes, link URLs; paragraph
 /// breaks become '\n', soft line breaks a space. Fenced code is kept verbatim.
-fn strip_md(src: &str) -> String {
+/// Also returns, per output char, the char index it came from in `src`, so a
+/// match in stripped space can be mapped back to a source range.
+fn strip_md_mapped(src: &str) -> (String, Vec<usize>) {
     let mut out = String::with_capacity(src.len());
+    let mut map: Vec<usize> = Vec::with_capacity(src.len());
     let mut in_fence = false;
-    for line in src.lines() {
-        let trimmed = line.trim();
+    let mut line_start = 0usize; // char index of current line start in src
+    for line in src.split_inclusive('\n') {
+        let line_chars = line.chars().count();
+        let body = line.trim_end_matches(['\n', '\r']);
+        let trimmed = body.trim();
+        let push = |out: &mut String, map: &mut Vec<usize>, c: char, src_idx: usize| {
+            out.push(c);
+            map.push(src_idx);
+        };
+
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_fence = !in_fence;
+            line_start += line_chars;
             continue;
         }
         if in_fence {
-            out.push_str(line);
-            out.push(' ');
+            for (i, c) in body.chars().enumerate() {
+                push(&mut out, &mut map, c, line_start + i);
+            }
+            push(&mut out, &mut map, ' ', line_start + body.chars().count());
+            line_start += line_chars;
             continue;
         }
         if trimmed.is_empty() {
             if !out.is_empty() && !out.ends_with('\n') {
                 while out.ends_with(' ') {
                     out.pop();
+                    map.pop();
                 }
-                out.push('\n');
+                push(&mut out, &mut map, '\n', line_start);
             }
+            line_start += line_chars;
             continue;
         }
+
+        // char offset of `trimmed` within the line
+        let mut off = body.chars().count() - body.trim_start().chars().count();
         let mut t = trimmed;
         // heading / quote / list / task prefixes
         let hashes = t.chars().take_while(|&c| c == '#').count();
         if hashes > 0 && t[hashes..].starts_with(' ') {
-            t = t[hashes + 1..].trim_start();
+            let rest = t[hashes + 1..].trim_start();
+            off += t.chars().count() - rest.chars().count();
+            t = rest;
         }
-        while let Some(rest) = t.strip_prefix('>') {
-            t = rest.trim_start();
+        while let Some(r) = t.strip_prefix('>') {
+            let rest = r.trim_start();
+            off += t.chars().count() - rest.chars().count();
+            t = rest;
         }
         if let Some(n) = crate::highlight::list_marker_len(t) {
+            off += t[..n].chars().count();
             t = &t[n..];
         }
         // inline markers
-        let mut chars = t.chars().peekable();
-        while let Some(c) = chars.next() {
+        let mut chars = t.chars().enumerate().peekable();
+        while let Some((i, c)) = chars.next() {
+            let src_idx = line_start + off + i;
             match c {
                 '*' | '_' | '`' | '~' => {}
-                '!' if chars.peek() == Some(&'[') => {}
+                '!' if chars.peek().map(|(_, c)| *c) == Some('[') => {}
                 ']' => {
-                    // drop "(url)" after a link/image text
-                    if chars.peek() == Some(&'(') {
-                        for c2 in chars.by_ref() {
+                    if chars.peek().map(|(_, c)| *c) == Some('(') {
+                        for (_, c2) in chars.by_ref() {
                             if c2 == ')' {
                                 break;
                             }
@@ -1740,15 +1928,21 @@ fn strip_md(src: &str) -> String {
                     }
                 }
                 '[' => {}
-                _ => out.push(c),
+                _ => push(&mut out, &mut map, c, src_idx),
             }
         }
-        out.push(' '); // soft break
+        push(&mut out, &mut map, ' ', line_start + off + t.chars().count()); // soft break
+        line_start += line_chars;
     }
     while out.ends_with(' ') || out.ends_with('\n') {
         out.pop();
+        map.pop();
     }
-    out
+    (out, map)
+}
+
+fn strip_md(src: &str) -> String {
+    strip_md_mapped(src).0
 }
 
 /// Find `needle` in `hay` starting at `from`, treating any whitespace run
