@@ -1818,6 +1818,17 @@ fn lift_nested_fences(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// Test-only re-exports of the mirror matching internals.
+#[doc(hidden)]
+pub fn debug_strip_md(src: &str) -> String {
+    strip_md(src)
+}
+
+#[doc(hidden)]
+pub fn debug_find_tolerant(hay: &[char], needle: &[char], from: usize) -> Option<(usize, usize)> {
+    find_tolerant(hay, needle, from)
+}
+
 /// Highlight rects for a char range of a laid-out galley (row-accurate,
 /// clamped to real glyphs so trailing newlines don't produce stray bars).
 fn galley_range_rects(
@@ -1950,11 +1961,15 @@ fn strip_md(src: &str) -> String {
 
 /// Find `needle` in `hay` starting at `from`, treating any whitespace run
 /// (including none on the hay side at galley boundaries) as equivalent.
+/// When chars don't align, Markdown marker chars on the hay side are skipped:
+/// the needle comes from `strip_md`, which drops `_`/`*`/`~`/brackets even
+/// where the renderer keeps them literally (e.g. `entra_oid`, `[web:25]`).
 /// Returns the matched hay range.
 fn find_tolerant(hay: &[char], needle: &[char], from: usize) -> Option<(usize, usize)> {
     if needle.is_empty() {
         return None;
     }
+    let hay_skippable = |c: char| matches!(c, '_' | '*' | '~' | '[' | ']');
     'outer: for start in from..hay.len() {
         if hay[start].is_whitespace() {
             continue;
@@ -1970,13 +1985,11 @@ fn find_tolerant(hay: &[char], needle: &[char], from: usize) -> Option<(usize, u
                 }
                 continue;
             }
-            if i < hay.len() && hay[i].is_whitespace() {
-                i += 1;
-                continue;
-            }
             if i < hay.len() && hay[i] == needle[j] {
                 i += 1;
                 j += 1;
+            } else if i < hay.len() && (hay[i].is_whitespace() || hay_skippable(hay[i])) {
+                i += 1;
             } else {
                 continue 'outer;
             }
