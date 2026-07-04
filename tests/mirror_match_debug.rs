@@ -37,6 +37,14 @@ Acceptance criteria:
 
 **Rollback if anything goes wrong:**
 - Code: `git checkout main && mcrestart`.
+
+Back up every SQLite DB using SQLite's online backup (safe while the app
+is running — do NOT just `cp` a live DB): it doesn't lock 'readers' at all.
+
+- run `sqlite3 "$db" ".backup '$HOME/mc-backups/$TS/$(basename $db)'"` first
+
+An unpaired backtick ` stays literal, and so does a stray * star. Don't
+forget curly quotes: it’s ‘fine’ to paste “smart” text from chat tools.
 "#;
 
 #[test]

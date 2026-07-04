@@ -1013,7 +1013,8 @@ impl App {
         for seg in &segments {
             let Some((s, e)) = find_tolerant(&flat, seg, from) else {
                 if first_fail.is_none() {
-                    first_fail = Some(seg.iter().take(40).collect());
+                    let head: String = seg.iter().take(30).collect();
+                    first_fail = Some(format!("{head:?} — {}", match_divergence(&flat, seg)));
                 }
                 continue;
             };
@@ -1149,10 +1150,11 @@ impl App {
         let mut last = 0;
         for p in &pieces {
             let Some((s, e)) = find_tolerant(&hay, p, from) else {
-                let frag: String = p.iter().take(40).collect();
+                let frag: String = p.iter().take(30).collect();
                 self.diag_p2e = format!(
-                    "stuck: {} pieces from {galley_count} galleys, piece unmatched in source: {frag:?}",
-                    pieces.len()
+                    "stuck: {} pieces from {galley_count} galleys, piece unmatched: {frag:?} — {}",
+                    pieces.len(),
+                    match_divergence(&hay, p)
                 );
                 return;
             };
@@ -2130,7 +2132,7 @@ fn find_tolerant(hay: &[char], needle: &[char], from: usize) -> Option<(usize, u
     if needle.is_empty() {
         return None;
     }
-    let hay_skippable = |c: char| matches!(c, '_' | '*' | '~' | '[' | ']');
+    let marker = |c: char| matches!(c, '_' | '*' | '~' | '[' | ']' | '`');
     'outer: for start in from..hay.len() {
         if hay[start].is_whitespace() {
             continue;
@@ -2149,8 +2151,13 @@ fn find_tolerant(hay: &[char], needle: &[char], from: usize) -> Option<(usize, u
             if i < hay.len() && hay[i] == needle[j] {
                 i += 1;
                 j += 1;
-            } else if i < hay.len() && (hay[i].is_whitespace() || hay_skippable(hay[i])) {
+            } else if i < hay.len() && (hay[i].is_whitespace() || marker(hay[i])) {
                 i += 1;
+            } else if marker(needle[j]) {
+                // markers can survive on either side (e.g. an unpaired
+                // backtick stays literal in the rendered text, and rendered
+                // pieces fed back as needles still carry it)
+                j += 1;
             } else {
                 continue 'outer;
             }
@@ -2158,6 +2165,54 @@ fn find_tolerant(hay: &[char], needle: &[char], from: usize) -> Option<(usize, u
         return Some((start, i));
     }
     None
+}
+
+/// Where does `needle` stop matching `hay` at hay position `start`?
+/// Returns (needle_idx, hay_char, needle_char) at the divergence, for diagnostics.
+fn match_divergence(hay: &[char], needle: &[char]) -> String {
+    // find the anchor with the longest progress into the needle
+    let mut best = (0usize, None::<(Option<char>, char)>);
+    for start in 0..hay.len() {
+        if hay[start].is_whitespace() {
+            continue;
+        }
+        let marker = |c: char| matches!(c, '_' | '*' | '~' | '[' | ']' | '`');
+        let (mut i, mut j) = (start, 0);
+        while j < needle.len() {
+            if needle[j].is_whitespace() {
+                while j < needle.len() && needle[j].is_whitespace() {
+                    j += 1;
+                }
+                while i < hay.len() && hay[i].is_whitespace() {
+                    i += 1;
+                }
+                continue;
+            }
+            if i < hay.len() && hay[i] == needle[j] {
+                i += 1;
+                j += 1;
+            } else if i < hay.len() && (hay[i].is_whitespace() || marker(hay[i])) {
+                i += 1;
+            } else if marker(needle[j]) {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if j > best.0 {
+            best = (j, Some((hay.get(i).copied(), needle.get(j).copied().unwrap_or(' '))));
+        }
+        if j >= needle.len() {
+            return "full match".into();
+        }
+    }
+    match best {
+        (j, Some((h, n))) => {
+            let ctx: String = needle[j.saturating_sub(15)..j.min(needle.len())].iter().collect();
+            format!("diverged at needle char {j} after {ctx:?}: rendered has {h:?}, selection needs {n:?}")
+        }
+        _ => "no anchor matched at all".into(),
+    }
 }
 
 fn char_to_byte(s: &str, char_idx: usize) -> usize {
@@ -2257,6 +2312,13 @@ mod tests {
         let needle2: Vec<char> = "boldtext".chars().collect();
         assert!(find_tolerant(&hay2, &needle2, 0).is_some());
         assert!(find_tolerant(&hay, &"missing".chars().collect::<Vec<_>>(), 0).is_none());
+        // unpaired markers survive on either side
+        let hay3: Vec<char> = "a ` stray backtick and don`t".chars().collect();
+        let needle3: Vec<char> = "a  stray backtick and dont".chars().collect();
+        assert!(find_tolerant(&hay3, &needle3, 0).is_some());
+        let hay4: Vec<char> = "a  stray backtick".chars().collect();
+        let needle4: Vec<char> = "a ` stray backtick".chars().collect();
+        assert!(find_tolerant(&hay4, &needle4, 0).is_some());
     }
 
     #[test]
