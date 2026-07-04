@@ -1033,9 +1033,12 @@ impl App {
         if !(self.prefs.sync_scroll && self.mode == Mode::Split) {
             return;
         }
-        if ctx.memory(|m| m.has_focus(self.editor_id())) {
-            return; // user is working the editor side; other direction applies
-        }
+        // A live preview selection is the signal that the user is working the
+        // preview side — do NOT gate on editor focus: the editor keeps
+        // keyboard focus even while the user drags on the preview (labels
+        // never take focus), which used to disable this direction entirely
+        // in real use. The editor→preview direction already stands down
+        // whenever this selection exists.
         if !ctx
             .plugin::<egui::text_selection::LabelSelectionState>()
             .lock()

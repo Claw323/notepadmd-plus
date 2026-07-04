@@ -60,6 +60,23 @@ fn preview_selection_mirrors_to_editor() {
         });
     harness.run();
 
+    // real-world precondition: the user has been working in the editor, so it
+    // holds keyboard focus before they drag on the preview
+    for pressed in [true, false] {
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: egui::Pos2::new(200.0, 120.0),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+    }
+    let editor_id = harness.state().debug_editor_id();
+    assert!(
+        harness.ctx.memory(|m| m.has_focus(editor_id)),
+        "precondition: editor must be focused like in real use"
+    );
+
     // drag-select on the preview (right pane) across the paragraph
     let start = egui::Pos2::new(530.0, 160.0);
     let end = egui::Pos2::new(950.0, 175.0);
