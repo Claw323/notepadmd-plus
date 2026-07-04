@@ -34,11 +34,20 @@ fn editor_selection_mirrors_to_preview() {
     st.cursor
         .set_char_range(Some(CCursorRange::two(CCursor::new(start), CCursor::new(end))));
     st.store(&ctx, editor_id);
-    ctx.memory_mut(|m| m.request_focus(editor_id));
+    // field condition: a drag-selection is not a click, so the editor often
+    // has a selection while keyboard focus sits elsewhere (e.g. a toolbar
+    // button) — the mirror must still run
+    ctx.memory_mut(|m| m.surrender_focus(editor_id));
 
     for _ in 0..4 {
         harness.run();
     }
+    let (e2p, _) = harness.state().debug_diag();
+    println!("editor→preview: {e2p}");
+    assert!(
+        e2p.starts_with("active"),
+        "editor→preview mirror must run without editor focus: {e2p}"
+    );
 
     let img = harness.render().expect("render");
     let out = std::env::var("REPRO_OUT").unwrap_or_else(|_| "/tmp/mirror_repro.png".into());

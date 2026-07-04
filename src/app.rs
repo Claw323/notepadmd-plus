@@ -277,6 +277,11 @@ impl App {
         self.editor_mirror_range
     }
 
+    #[doc(hidden)]
+    pub fn debug_diag(&self) -> (String, String) {
+        (self.diag_e2p.clone(), self.diag_p2e.clone())
+    }
+
     // ---------- file operations ----------
 
     fn load_path(&mut self, path: &Path) {
@@ -937,14 +942,12 @@ impl App {
             self.diag_e2p = "off: sync disabled or not split".into();
             return;
         }
-        // only while the user is actively working in the editor — otherwise a
-        // stale editor selection keeps painting ghosts while the user selects
-        // things on the preview side (labels never take keyboard focus, so
-        // also stand down whenever the preview has its own live selection)
-        if !ctx.memory(|m| m.has_focus(self.editor_id())) {
-            self.diag_e2p = "idle: editor not focused".into();
-            return;
-        }
+        // Do NOT gate on editor focus: drag-selecting in the TextEdit is not a
+        // "click", so on real machines the editor often has a live selection
+        // while keyboard focus still sits on e.g. a toolbar button (proven by
+        // field diagnostics: focused=false with selection 296..1283). The
+        // editor's own selection stays visible in that state, so mirroring it
+        // is consistent. Yield only when the preview has its own selection.
         if ctx
             .plugin::<egui::text_selection::LabelSelectionState>()
             .lock()
