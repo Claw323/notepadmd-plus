@@ -1009,12 +1009,12 @@ impl App {
         let mut shapes: Vec<egui::Shape> = Vec::new();
         let mut from = 0;
         let mut matched = 0usize;
-        let mut first_fail: Option<String> = None;
+        let mut fails: Vec<String> = Vec::new();
         for seg in &segments {
             let Some((s, e)) = find_tolerant(&flat, seg, from) else {
-                if first_fail.is_none() {
+                if fails.len() < 3 {
                     let head: String = seg.iter().take(30).collect();
-                    first_fail = Some(format!("{head:?} — {}", match_divergence(&flat, seg)));
+                    fails.push(format!("{head:?} — {}", match_divergence(&flat, seg)));
                 }
                 continue;
             };
@@ -1042,7 +1042,11 @@ impl App {
             segments.len(),
             shapes.len(),
             toks.len(),
-            first_fail.map(|f| format!(", first fail: {f:?}")).unwrap_or_default()
+            if fails.is_empty() {
+                String::new()
+            } else {
+                format!("\n  fails: {}", fails.join("\n  fails: "))
+            }
         );
         if !shapes.is_empty() {
             // fill the placeholder reserved before the preview was painted, so
@@ -2043,7 +2047,9 @@ fn strip_md_mapped(src: &str) -> (String, Vec<usize>) {
             line_start += line_chars;
             continue;
         }
-        if trimmed.is_empty() {
+        // blank lines and horizontal rules are paragraph breaks: a rule is
+        // rendered as a line, not text, so it must never enter the needle
+        if trimmed.is_empty() || crate::highlight::is_hr(trimmed) {
             if !out.is_empty() && !out.ends_with('\n') {
                 while out.ends_with(' ') {
                     out.pop();

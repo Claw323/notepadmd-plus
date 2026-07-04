@@ -110,7 +110,7 @@ pub fn layout_job(text: &str, dark: bool) -> LayoutJob {
     job
 }
 
-fn is_hr(t: &str) -> bool {
+pub(crate) fn is_hr(t: &str) -> bool {
     let t = t.trim_end();
     t.len() >= 3 && (t.chars().all(|c| c == '-') || t.chars().all(|c| c == '*') || t.chars().all(|c| c == '_'))
 }

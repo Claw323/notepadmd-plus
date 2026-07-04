@@ -4,7 +4,11 @@
 
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
-const DOC: &str = r#"Microsoft Entra ID, while tab visibility and tab access should be controlled inside the application database.
+const DOC: &str = r#"# ⚠ Backup & safety protocol — READ FIRST, applies to EVERY item
+
+Microsoft Entra ID, while tab visibility and tab access should be controlled inside the application database.
+
+---
 
 ## Phase plan
 
@@ -102,8 +106,7 @@ fn segment_matching_against_rendered_stream() {
     println!("--- flattened stream ---\n{stream}\n---");
 
     // the selection: everything from "## Phase plan" to "Acceptance criteria:"
-    let sel_start = DOC.find("## Phase plan").unwrap();
-    let needle = notepadmd_plus::app::debug_strip_md(&DOC[sel_start..]);
+    let needle = notepadmd_plus::app::debug_strip_md(DOC);
     let mut failures = Vec::new();
     for seg in needle.split('\n') {
         let seg_chars: Vec<char> = seg.trim().chars().collect();
