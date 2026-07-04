@@ -992,7 +992,7 @@ impl App {
         let toks = self.collect_preview_galleys(ctx, layer);
         let mut flat: Vec<char> = Vec::new();
         let mut map: Vec<(usize, usize)> = Vec::new(); // flat idx -> (tok, char-in-galley)
-        for (ti, (_, g)) in toks.iter().enumerate() {
+        for (ti, (_, g, _)) in toks.iter().enumerate() {
             for (ci, ch) in g.text().chars().enumerate() {
                 flat.push(ch);
                 map.push((ti, ci));
@@ -1004,9 +1004,13 @@ impl App {
             }
         }
 
-        // match each selected paragraph in order, collect highlight rects
+        // match each selected paragraph in order, collect highlight rects;
+        // galleys on opaque block backgrounds (code blocks) get a translucent
+        // tint painted above instead, since the underlay would be covered
         let color = ctx.global_style().visuals.selection.bg_fill.gamma_multiply(0.55);
+        let over_color = ctx.global_style().visuals.selection.bg_fill.gamma_multiply(0.35);
         let mut shapes: Vec<egui::Shape> = Vec::new();
+        let mut over_shapes: Vec<egui::Shape> = Vec::new();
         let mut from = 0;
         let mut matched = 0usize;
         let mut fails: Vec<String> = Vec::new();
@@ -1032,15 +1036,20 @@ impl App {
                 }
             }
             for (ti, ca, cb) in by_tok {
-                let (pos, galley) = &toks[ti];
-                shapes.extend(galley_range_rects(*pos, galley, ca, cb, color));
+                let (pos, galley, on_bg) = &toks[ti];
+                if *on_bg {
+                    over_shapes.extend(galley_range_rects(*pos, galley, ca, cb, over_color));
+                } else {
+                    shapes.extend(galley_range_rects(*pos, galley, ca, cb, color));
+                }
             }
         }
         self.diag_e2p = format!(
-            "active: {}/{} segments matched, {} rects, {} galleys{}",
+            "active: {}/{} segments matched, {}+{} rects, {} galleys{}",
             matched,
             segments.len(),
             shapes.len(),
+            over_shapes.len(),
             toks.len(),
             if fails.is_empty() {
                 String::new()
@@ -1055,22 +1064,47 @@ impl App {
                 g.entry(layer).set(shape_idx, clip, egui::Shape::Vec(shapes));
             });
         }
+        if !over_shapes.is_empty() {
+            let painter = egui::Painter::new(ctx.clone(), layer, clip);
+            painter.add(egui::Shape::Vec(over_shapes));
+        }
     }
 
+    /// Preview galleys in paint order. The bool is true when the galley sits
+    /// on an opaque background rect painted later than the mirror's reserved
+    /// underlay slot (code blocks) — its glow must be painted on top instead.
     fn collect_preview_galleys(
         &self,
         ctx: &egui::Context,
         layer: egui::LayerId,
-    ) -> Vec<(egui::Pos2, std::sync::Arc<egui::Galley>)> {
+    ) -> Vec<(egui::Pos2, std::sync::Arc<egui::Galley>, bool)> {
         let mut toks = Vec::new();
+        let mut bg_rects: Vec<egui::Rect> = Vec::new();
+        let max_bg = self.preview_rect.height() * self.preview_rect.width() * 0.9;
         ctx.graphics(|g| {
             if let Some(list) = g.get(layer) {
                 for cs in list.all_entries() {
-                    if let egui::epaint::Shape::Text(ts) = &cs.shape {
-                        let rect = egui::Rect::from_min_size(ts.pos, ts.galley.size());
-                        if rect.intersects(self.preview_rect) && ts.pos.x >= self.preview_rect.left() - 2.0 {
-                            toks.push((ts.pos, ts.galley.clone()));
+                    match &cs.shape {
+                        egui::epaint::Shape::Rect(rs) => {
+                            // block backgrounds (code blocks etc.), but not the
+                            // panel background that covers the whole pane
+                            if rs.fill.a() > 128
+                                && rs.rect.intersects(self.preview_rect)
+                                && rs.rect.area() < max_bg
+                            {
+                                bg_rects.push(rs.rect);
+                            }
                         }
+                        egui::epaint::Shape::Text(ts) => {
+                            let rect = egui::Rect::from_min_size(ts.pos, ts.galley.size());
+                            if rect.intersects(self.preview_rect)
+                                && ts.pos.x >= self.preview_rect.left() - 2.0
+                            {
+                                let on_bg = bg_rects.iter().any(|r| r.contains(rect.center()));
+                                toks.push((ts.pos, ts.galley.clone(), on_bg));
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1112,7 +1146,7 @@ impl App {
         let galleys = self.collect_preview_galleys(ctx, layer);
         let galley_count = galleys.len();
         let mut pieces: Vec<Vec<char>> = Vec::new();
-        for (_, galley) in galleys {
+        for (_, galley, _) in galleys {
             let mut piece: Vec<char> = Vec::new();
             for placed in &galley.rows {
                 let (mut x0, mut x1) = (f32::INFINITY, f32::NEG_INFINITY);

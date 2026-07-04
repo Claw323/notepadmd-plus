@@ -142,6 +142,47 @@ fn preview_selection_mirrors_to_editor() {
 
 #[test]
 #[ignore = "visual repro; run explicitly"]
+fn fence_selection_mirrors_to_preview() {
+    // the user's structure: an indented fence inside a numbered list item
+    let doc = "**Before starting ANY fix:**\n1. `git status` — confirm a clean tree.\n2. **Back up every SQLite DB** using SQLite's online backup:\n   ```bash\n   TS=$(date +%Y%m%d-%H%M%S)\n   mkdir -p ~/mc-backups/$TS\n   ls -la ~/mc-backups/$TS\n   ```\n3. Note the current commit: `git rev-parse HEAD`.\n";
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1000.0, 640.0))
+        .build_eframe(|cc| {
+            cc.egui_ctx
+                .options_mut(|o| o.theme_preference = egui::ThemePreference::Dark);
+            let mut app = notepadmd_plus::app::App::new(cc);
+            app.debug_setup(doc, true);
+            app
+        });
+    harness.run();
+
+    // select exactly the fenced block, including the ``` marker lines
+    let start_b = doc.find("   ```bash").unwrap();
+    let end_b = doc.rfind("   ```").unwrap() + "   ```".len();
+    let start = doc[..start_b].chars().count();
+    let end = doc[..end_b].chars().count();
+
+    let editor_id = harness.state().debug_editor_id();
+    let ctx = harness.ctx.clone();
+    let mut st = egui::text_edit::TextEditState::load(&ctx, editor_id).unwrap_or_default();
+    st.cursor
+        .set_char_range(Some(CCursorRange::two(CCursor::new(start), CCursor::new(end))));
+    st.store(&ctx, editor_id);
+
+    for _ in 0..4 {
+        harness.run();
+    }
+    let (e2p, _) = harness.state().debug_diag();
+    println!("editor→preview: {e2p}");
+
+    let img = harness.render().expect("render");
+    let out = std::env::var("REPRO_OUT4").unwrap_or_else(|_| "/tmp/fence_mirror.png".into());
+    img.save(&out).expect("save png");
+    println!("wrote {out}");
+}
+
+#[test]
+#[ignore = "visual repro; run explicitly"]
 fn line_numbers_continue_past_first_screen() {
     let doc: String = (1..=200).map(|i| format!("line number {i}\n")).collect();
     let mut harness = egui_kittest::Harness::builder()
