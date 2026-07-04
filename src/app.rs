@@ -686,7 +686,10 @@ impl App {
         };
 
         let scroll = if wrap { egui::ScrollArea::vertical() } else { egui::ScrollArea::both() };
-        scroll.auto_shrink([false, false]).show(ui, |ui| {
+        // explicit ids: in split view ui.columns gives both columns the same
+        // stable id, so unsalted ScrollAreas collide and clobber each other's
+        // scroll state (preview side becomes unscrollable)
+        scroll.id_salt("editor-scroll").auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 let gutter = if self.prefs.line_numbers {
                     let digits = self.text.lines().count().max(1).ilog10() as usize + 1;
@@ -758,7 +761,7 @@ impl App {
 
     fn preview_ui(&mut self, ui: &mut egui::Ui) {
         self.preview_rect = ui.max_rect();
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("preview-scroll").auto_shrink([false, false]).show(ui, |ui| {
             highlight::reading_style(ui);
             // comfortable reading column
             let max_w = 860.0_f32.min(ui.available_width());
