@@ -1096,6 +1096,13 @@ impl App {
                             }
                         }
                         egui::epaint::Shape::Text(ts) => {
+                            // the code blocks' copy-button icons are text
+                            // shapes too, painted right after the code —
+                            // they must not interrupt the content stream
+                            let t = ts.galley.text().trim();
+                            if t == "🗐" || t == "✔" {
+                                continue;
+                            }
                             let rect = egui::Rect::from_min_size(ts.pos, ts.galley.size());
                             if rect.intersects(self.preview_rect)
                                 && ts.pos.x >= self.preview_rect.left() - 2.0

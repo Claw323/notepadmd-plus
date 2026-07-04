@@ -156,9 +156,11 @@ fn fence_selection_mirrors_to_preview() {
         });
     harness.run();
 
-    // select exactly the fenced block, including the ``` marker lines
+    // select from the fenced block through the item after it, so the matched
+    // segment must cross the code block's bottom edge (where the copy-button
+    // icon glyph sits in the paint stream)
     let start_b = doc.find("   ```bash").unwrap();
-    let end_b = doc.rfind("   ```").unwrap() + "   ```".len();
+    let end_b = doc.find("rollback).").map(|i| i + "rollback).".len()).unwrap_or(doc.len());
     let start = doc[..start_b].chars().count();
     let end = doc[..end_b].chars().count();
 
@@ -174,6 +176,8 @@ fn fence_selection_mirrors_to_preview() {
     }
     let (e2p, _) = harness.state().debug_diag();
     println!("editor→preview: {e2p}");
+    assert!(e2p.starts_with("active"), "mirror must run: {e2p}");
+    assert!(!e2p.contains("fails:"), "all segments must match across the code block: {e2p}");
 
     let img = harness.render().expect("render");
     let out = std::env::var("REPRO_OUT4").unwrap_or_else(|_| "/tmp/fence_mirror.png".into());
