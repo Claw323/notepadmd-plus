@@ -30,6 +30,13 @@ Out of scope:
 
 Acceptance criteria:
 - A user can sign in with Microsoft credentials [web:25][web:36]
+
+**After each fix, before deploying:**
+4. `npm run build` must pass green.
+5. Use `/verify` (or manually drive the affected flow) to confirm.
+
+**Rollback if anything goes wrong:**
+- Code: `git checkout main && mcrestart`.
 "#;
 
 #[test]
