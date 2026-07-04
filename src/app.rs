@@ -67,6 +67,12 @@ impl Default for Prefs {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuSide {
+    Editor,
+    Preview,
+}
+
 /// An action deferred behind the "unsaved changes" confirmation.
 #[derive(Clone)]
 enum Pending {
@@ -106,10 +112,16 @@ pub struct App {
     lossy_offer: Option<(PathBuf, Vec<u8>)>, // invalid-UTF-8 file, offer lossy open
     allow_close: bool,
 
-    // preview right-click menu
-    preview_menu: Option<egui::Pos2>,
-    preview_menu_opened: bool, // opened this frame; skip the dismiss check once
-    preview_rect: egui::Rect,  // last frame's preview area, for hit-testing clicks
+    // right-click context menus (editor + preview)
+    ctx_menu: Option<(egui::Pos2, MenuSide)>,
+    ctx_menu_opened: bool, // opened this frame; skip the dismiss check once
+    ctx_menu_can_paste: bool,
+    pending_context_click: Option<egui::Pos2>, // secondary click captured in raw_input_hook
+    preview_rect: egui::Rect, // last frame's preview area, for hit-testing clicks
+    editor_rect: egui::Rect,  // last frame's editor area
+    // editor events (undo/cut/paste…) queued by menus, replayed at frame start
+    // so the editor — which renders before the menus — actually receives them
+    pending_editor_events: Vec<egui::Event>,
 
     // disk change watching
     disk_mtime: Option<SystemTime>,
@@ -161,9 +173,13 @@ impl App {
             reload_prompt: false,
             lossy_offer: None,
             allow_close: false,
-            preview_menu: None,
-            preview_menu_opened: false,
+            ctx_menu: None,
+            ctx_menu_opened: false,
+            ctx_menu_can_paste: false,
+            pending_context_click: None,
             preview_rect: egui::Rect::NOTHING,
+            editor_rect: egui::Rect::NOTHING,
+            pending_editor_events: Vec::new(),
             disk_mtime: None,
             last_disk_check: Instant::now(),
             last_title: String::new(),
@@ -471,23 +487,21 @@ impl App {
                 let editing = self.mode != Mode::Pretty;
                 ui.add_enabled_ui(editing, |ui| {
                     if ui.button("Undo\tCtrl+Z").clicked() {
-                        self.send_editor_key(ctx, Key::Z, Modifiers::COMMAND);
+                        self.send_editor_key(Key::Z, Modifiers::COMMAND);
                     }
                     if ui.button("Redo\tCtrl+Y").clicked() {
-                        self.send_editor_key(ctx, Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
+                        self.send_editor_key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
                     }
                     ui.separator();
                     if ui.button("Cut\tCtrl+X").clicked() {
-                        self.send_editor_event(ctx, egui::Event::Cut);
+                        self.send_editor_event(egui::Event::Cut);
                     }
                     if ui.button("Copy\tCtrl+C").clicked() {
-                        self.send_editor_event(ctx, egui::Event::Copy);
+                        self.send_editor_event(egui::Event::Copy);
                     }
                     if ui.button("Paste\tCtrl+V").clicked() {
-                        if let Ok(mut cb) = arboard::Clipboard::new() {
-                            if let Ok(t) = cb.get_text() {
-                                self.send_editor_event(ctx, egui::Event::Paste(t));
-                            }
+                        if let Ok(t) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+                            self.send_editor_event(egui::Event::Paste(t));
                         }
                     }
                     ui.separator();
@@ -559,16 +573,18 @@ impl App {
         }
     }
 
-    fn send_editor_key(&mut self, ctx: &egui::Context, key: Key, modifiers: Modifiers) {
-        ctx.memory_mut(|m| m.request_focus(self.editor_id()));
-        ctx.input_mut(|i| {
-            i.events.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers });
+    fn send_editor_key(&mut self, key: Key, modifiers: Modifiers) {
+        self.pending_editor_events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
         });
     }
 
-    fn send_editor_event(&mut self, ctx: &egui::Context, ev: egui::Event) {
-        ctx.memory_mut(|m| m.request_focus(self.editor_id()));
-        ctx.input_mut(|i| i.events.push(ev));
+    fn send_editor_event(&mut self, ev: egui::Event) {
+        self.pending_editor_events.push(ev);
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -637,6 +653,7 @@ impl App {
     }
 
     fn editor_ui(&mut self, ui: &mut egui::Ui) {
+        self.editor_rect = ui.max_rect();
         let dark = ui.visuals().dark_mode;
         let wrap = self.prefs.word_wrap;
         let mut layouter = move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
@@ -711,6 +728,9 @@ impl App {
                 }
             });
         });
+        if self.text.is_empty() && self.path.is_none() {
+            draw_empty_state(ui, self.editor_rect);
+        }
     }
 
     fn preview_ui(&mut self, ui: &mut egui::Ui) {
@@ -728,6 +748,9 @@ impl App {
                     CommonMarkViewer::new().show(ui, &mut self.md_cache, &shown);
                 });
         });
+        if self.text.is_empty() && self.path.is_none() {
+            draw_empty_state(ui, self.preview_rect);
+        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -759,40 +782,79 @@ impl App {
         });
     }
 
-    fn preview_context_menu(&mut self, ctx: &egui::Context) {
-        let Some(pos) = self.preview_menu else { return };
-        let has_selection = ctx
-            .plugin::<egui::text_selection::LabelSelectionState>()
-            .lock()
-            .has_selection();
-        let area = egui::Area::new(egui::Id::new("preview-ctx-menu"))
+    fn context_menu(&mut self, ctx: &egui::Context) {
+        let Some((pos, side)) = self.ctx_menu else { return };
+        let area = egui::Area::new(egui::Id::new("ctx-menu"))
             .fixed_pos(pos)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::menu(ui.style()).show(ui, |ui| {
                     ui.set_min_width(170.0);
                     let mut close = false;
-                    // the selected text was already copied when the menu opened
-                    // (see update()); this item just confirms it
-                    if ui.add_enabled(has_selection, egui::Button::new("Copy")).clicked() {
-                        close = true;
-                    }
-                    if ui.button("Copy All (Markdown)").clicked() {
-                        ctx.copy_text(self.text.clone());
-                        close = true;
-                    }
-                    ui.separator();
-                    if ui.button("Edit in Plain Text").clicked() {
-                        self.mode = Mode::Plain;
-                        close = true;
+                    let mut item = |ui: &mut egui::Ui, enabled: bool, label: &str| {
+                        let clicked = ui
+                            .add_enabled(enabled, egui::Button::new(label))
+                            .clicked();
+                        close |= clicked;
+                        clicked
+                    };
+                    match side {
+                        MenuSide::Editor => {
+                            // standard Windows edit-control menu
+                            let has_sel = self
+                                .cursor_char_range(ctx)
+                                .is_some_and(|r| r.primary.index.0 != r.secondary.index.0);
+                            if item(ui, true, "Undo") {
+                                self.send_editor_key(Key::Z, Modifiers::COMMAND);
+                            }
+                            if item(ui, true, "Redo") {
+                                self.send_editor_key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
+                            }
+                            ui.separator();
+                            if item(ui, has_sel, "Cut") {
+                                self.send_editor_event(egui::Event::Cut);
+                            }
+                            if item(ui, has_sel, "Copy") {
+                                self.send_editor_event(egui::Event::Copy);
+                            }
+                            if item(ui, self.ctx_menu_can_paste, "Paste") {
+                                if let Ok(t) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+                                    self.send_editor_event(egui::Event::Paste(t));
+                                }
+                            }
+                            if item(ui, has_sel, "Delete") {
+                                self.send_editor_key(Key::Delete, Modifiers::NONE);
+                            }
+                            ui.separator();
+                            if item(ui, true, "Select All") {
+                                let n = self.text.chars().count();
+                                self.select_range(ctx, 0, n);
+                            }
+                        }
+                        MenuSide::Preview => {
+                            let has_selection = ctx
+                                .plugin::<egui::text_selection::LabelSelectionState>()
+                                .lock()
+                                .has_selection();
+                            // the selected text was already copied when the menu
+                            // opened (see update()); this item just confirms it
+                            item(ui, has_selection, "Copy");
+                            if item(ui, true, "Copy All (Markdown)") {
+                                ctx.copy_text(self.text.clone());
+                            }
+                            ui.separator();
+                            if item(ui, true, "Edit in Plain Text") {
+                                self.mode = Mode::Plain;
+                            }
+                        }
                     }
                     if close {
-                        self.preview_menu = None;
+                        self.ctx_menu = None;
                     }
                 });
             });
-        if self.preview_menu_opened {
-            self.preview_menu_opened = false;
+        if self.ctx_menu_opened {
+            self.ctx_menu_opened = false;
         } else {
             let dismiss = ctx.input(|i| {
                 i.key_pressed(Key::Escape)
@@ -800,7 +862,7 @@ impl App {
                         && !i.pointer.interact_pos().is_some_and(|p| area.response.rect.contains(p)))
             });
             if dismiss {
-                self.preview_menu = None;
+                self.ctx_menu = None;
             }
         }
     }
@@ -1045,6 +1107,10 @@ impl App {
         if revert && self.path.is_some() {
             self.request(Pending::Revert, ctx);
         }
+        // Windows-standard Redo shortcut; egui's TextEdit only knows Ctrl+Shift+Z
+        if ctx.input_mut(|i| i.consume_shortcut(&sc(Modifiers::COMMAND, Key::Y))) {
+            self.send_editor_key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
+        }
     }
 
     fn poll_disk(&mut self) {
@@ -1101,20 +1167,33 @@ impl eframe::App for App {
             self.confirm = Some(Pending::Exit);
         }
 
-        // Right-click in the preview: open the context menu, and inject a Copy
-        // event *now*, before the labels render — egui's label selection only
-        // honors Copy while it processes the labels, and any later click (e.g.
-        // on a menu button) clears the selection. No-op when nothing is selected.
-        if self.mode != Mode::Plain && !self.any_modal_open() {
-            let click = ctx.input(|i| {
-                i.pointer
-                    .interact_pos()
-                    .filter(|p| i.pointer.secondary_clicked() && self.preview_rect.contains(*p))
-            });
-            if let Some(pos) = click {
-                ctx.input_mut(|i| i.events.push(egui::Event::Copy));
-                self.preview_menu = Some(pos);
-                self.preview_menu_opened = true;
+        // Replay editor events queued by menu clicks last frame (the editor
+        // renders before the menus, so same-frame events would be missed).
+        if !self.pending_editor_events.is_empty() {
+            ctx.memory_mut(|m| m.request_focus(self.editor_id()));
+            let events = std::mem::take(&mut self.pending_editor_events);
+            ctx.input_mut(|i| i.events.extend(events));
+        }
+
+        // Right-click (captured and swallowed in raw_input_hook so selections
+        // survive it, as in native Windows apps): open the matching context
+        // menu. For the preview, also inject a Copy event *now*, before the
+        // labels render — egui's label selection only honors Copy while it
+        // processes the labels, and any later click (e.g. on a menu button)
+        // clears the selection. No-op when nothing is selected.
+        if let Some(pos) = self.pending_context_click.take() {
+            if !self.any_modal_open() {
+                if self.mode != Mode::Plain && self.preview_rect.contains(pos) {
+                    ctx.input_mut(|i| i.events.push(egui::Event::Copy));
+                    self.ctx_menu = Some((pos, MenuSide::Preview));
+                    self.ctx_menu_opened = true;
+                } else if self.mode != Mode::Pretty && self.editor_rect.contains(pos) {
+                    self.ctx_menu_can_paste = arboard::Clipboard::new()
+                        .and_then(|mut c| c.get_text())
+                        .is_ok_and(|t| !t.is_empty());
+                    self.ctx_menu = Some((pos, MenuSide::Editor));
+                    self.ctx_menu_opened = true;
+                }
             }
         }
 
@@ -1142,8 +1221,32 @@ impl eframe::App for App {
                 }
             });
 
-        self.preview_context_menu(ctx);
+        self.context_menu(ctx);
         self.modals(ctx);
+    }
+
+    /// Swallow right-clicks before egui sees them: both the editor's and the
+    /// preview's text selections are cleared by egui on *any* pointer press,
+    /// but native Windows apps keep the selection on right-click (that's how
+    /// "right-click the highlight → Copy" works). We capture the position and
+    /// open our own context menu in update() instead.
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        raw_input.events.retain(|e| {
+            if let egui::Event::PointerButton {
+                button: egui::PointerButton::Secondary,
+                pressed,
+                pos,
+                ..
+            } = e
+            {
+                if !pressed {
+                    self.pending_context_click = Some(*pos);
+                }
+                false
+            } else {
+                true
+            }
+        });
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1154,6 +1257,46 @@ impl eframe::App for App {
 }
 
 // ---------- helpers ----------
+
+/// Friendly watermark shown when nothing is open yet (new empty document).
+fn draw_empty_state(ui: &egui::Ui, rect: egui::Rect) {
+    let p = ui.painter_at(rect);
+    let dark = ui.visuals().dark_mode;
+    let center = rect.center() - egui::vec2(0.0, 30.0);
+
+    let tile = if dark {
+        egui::Color32::from_white_alpha(8)
+    } else {
+        egui::Color32::from_black_alpha(10)
+    };
+    let accent = egui::Color32::from_rgb(86, 156, 214)
+        .gamma_multiply(if dark { 0.55 } else { 0.8 });
+    let faint = ui.visuals().weak_text_color().gamma_multiply(0.75);
+
+    let icon = egui::Rect::from_center_size(center - egui::vec2(0.0, 40.0), egui::vec2(112.0, 112.0));
+    p.rect_filled(icon, 26.0, tile);
+    p.text(
+        icon.center(),
+        egui::Align2::CENTER_CENTER,
+        "MD+",
+        egui::FontId::monospace(38.0),
+        accent,
+    );
+    p.text(
+        center + egui::vec2(0.0, 48.0),
+        egui::Align2::CENTER_CENTER,
+        "NotepadMD+",
+        egui::FontId::proportional(22.0),
+        faint,
+    );
+    p.text(
+        center + egui::vec2(0.0, 78.0),
+        egui::Align2::CENTER_CENTER,
+        "Start typing  ·  Ctrl+O to open  ·  or drop a file here",
+        egui::FontId::proportional(14.0),
+        faint.gamma_multiply(0.8),
+    );
+}
 
 fn apply_theme(ctx: &egui::Context, theme: ThemePref) {
     ctx.options_mut(|o| {
