@@ -856,8 +856,16 @@ impl App {
         }
         // only while the user is actively working in the editor — otherwise a
         // stale editor selection keeps painting ghosts while the user selects
-        // things on the preview side
+        // things on the preview side (labels never take keyboard focus, so
+        // also stand down whenever the preview has its own live selection)
         if !ctx.memory(|m| m.has_focus(self.editor_id())) {
+            return;
+        }
+        if ctx
+            .plugin::<egui::text_selection::LabelSelectionState>()
+            .lock()
+            .has_selection()
+        {
             return;
         }
         let Some(r) = self.cursor_char_range(ctx) else { return };

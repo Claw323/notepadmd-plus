@@ -9,14 +9,18 @@ pub fn rule(ui: &mut Ui, end_line: bool) {
     }
 }
 
+// NotepadMD+ patch: spacer labels must not join the text selection — when
+// selected, egui paints a "selected newline" stub over the first characters
+// of the following line. Copy still gets newlines: egui's label selection
+// inserts them from galley geometry, not from these spacers.
 #[inline]
 pub fn soft_break(ui: &mut Ui) {
-    ui.label(" ");
+    ui.add(egui::Label::new(" ").selectable(false));
 }
 
 #[inline]
 pub fn newline(ui: &mut Ui) {
-    ui.label("\n");
+    ui.add(egui::Label::new("\n").selectable(false));
 }
 
 pub fn bullet_point(ui: &mut Ui) {
