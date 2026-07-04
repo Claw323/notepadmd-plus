@@ -154,6 +154,9 @@ pub struct App {
     pending_editor_offset: Option<f32>,
     pending_preview_offset: Option<f32>,
     preview_layer: Option<egui::LayerId>,
+    // placeholder shape reserved before the preview renders; the selection
+    // mirror fills it in later so its highlight draws *under* the text
+    mirror_shape: Option<(egui::layers::ShapeIdx, egui::Rect)>,
 
     // disk change watching
     disk_mtime: Option<SystemTime>,
@@ -219,6 +222,7 @@ impl App {
             pending_editor_offset: None,
             pending_preview_offset: None,
             preview_layer: None,
+            mirror_shape: None,
             preview_rect: egui::Rect::NOTHING,
             editor_rect: egui::Rect::NOTHING,
             pending_editor_events: Vec::new(),
@@ -794,6 +798,7 @@ impl App {
             scroll = scroll.vertical_scroll_offset(o);
         }
         let sout = scroll.id_salt("preview-scroll").auto_shrink([false, false]).show(ui, |ui| {
+            self.mirror_shape = Some((ui.painter().add(egui::Shape::Noop), ui.clip_rect()));
             highlight::reading_style(ui);
             // comfortable reading column
             let max_w = 860.0_f32.min(ui.available_width());
@@ -849,6 +854,12 @@ impl App {
         if !(self.prefs.sync_scroll && self.mode == Mode::Split) {
             return;
         }
+        // only while the user is actively working in the editor — otherwise a
+        // stale editor selection keeps painting ghosts while the user selects
+        // things on the preview side
+        if !ctx.memory(|m| m.has_focus(self.editor_id())) {
+            return;
+        }
         let Some(r) = self.cursor_char_range(ctx) else { return };
         let (a, b) = (r.primary.index.0.min(r.secondary.index.0), r.primary.index.0.max(r.secondary.index.0));
         if a == b {
@@ -860,12 +871,14 @@ impl App {
         let segments: Vec<Vec<char>> = needle
             .split('\n')
             .map(|s| s.trim().chars().collect::<Vec<_>>())
-            .filter(|s: &Vec<char>| s.len() >= 2)
+            .filter(|s: &Vec<char>| s.len() >= 3)
+            .take(50)
             .collect();
         if segments.is_empty() {
             return;
         }
         let Some(layer) = self.preview_layer else { return };
+        let Some((shape_idx, clip)) = self.mirror_shape else { return };
 
         // Collect the preview's galleys in paint (reading) order and flatten
         // them into one char stream; galley boundaries count as whitespace.
@@ -896,9 +909,9 @@ impl App {
             }
         }
 
-        // match each selected paragraph in order, then tint the matched rows
-        let color = ctx.global_style().visuals.selection.bg_fill.gamma_multiply(0.4);
-        let painter = egui::Painter::new(ctx.clone(), layer, self.preview_rect);
+        // match each selected paragraph in order, collect highlight rects
+        let color = ctx.global_style().visuals.selection.bg_fill.gamma_multiply(0.55);
+        let mut shapes: Vec<egui::Shape> = Vec::new();
         let mut from = 0;
         for seg in &segments {
             let Some((s, e)) = find_tolerant(&flat, seg, from) else { continue };
@@ -919,19 +932,33 @@ impl App {
                 let mut cum = 0usize;
                 for placed in &galley.rows {
                     let n = placed.char_count_including_newline().0;
+                    let visible = placed.char_count_excluding_newline().0;
                     let (lo, hi) = (ca.max(cum), cb.min(cum + n));
                     if lo < hi {
-                        let x0 = placed.x_offset(egui::epaint::text::CharIndex(lo - cum));
-                        let x1 = placed.x_offset(egui::epaint::text::CharIndex(hi - cum));
-                        let rect = egui::Rect::from_min_max(
-                            *pos + placed.pos.to_vec2() + egui::vec2(x0, 0.0),
-                            *pos + placed.pos.to_vec2() + egui::vec2(x1, placed.row.height()),
-                        );
-                        painter.rect_filled(rect, 2.0, color);
+                        // clamp to real glyphs so a trailing newline can't
+                        // produce a rect past the row's text
+                        let col_a = (lo - cum).min(visible);
+                        let col_b = (hi - cum).min(visible);
+                        if col_a < col_b {
+                            let x0 = placed.x_offset(egui::epaint::text::CharIndex(col_a));
+                            let x1 = placed.x_offset(egui::epaint::text::CharIndex(col_b));
+                            let rect = egui::Rect::from_min_max(
+                                *pos + placed.pos.to_vec2() + egui::vec2(x0, 0.0),
+                                *pos + placed.pos.to_vec2() + egui::vec2(x1, placed.row.height()),
+                            );
+                            shapes.push(egui::Shape::rect_filled(rect, 2.0, color));
+                        }
                     }
                     cum += n;
                 }
             }
+        }
+        if !shapes.is_empty() {
+            // fill the placeholder reserved before the preview was painted, so
+            // the highlight renders *under* the text instead of covering it
+            ctx.graphics_mut(|g| {
+                g.entry(layer).set(shape_idx, clip, egui::Shape::Vec(shapes));
+            });
         }
     }
 
