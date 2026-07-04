@@ -1,0 +1,41 @@
+[package]
+name = "notepadmd_plus"
+version = "1.0.0"
+edition = "2024"
+description = "NotepadMD+ — a lightweight Markdown notepad for Windows"
+license = "MIT"
+repository = "https://github.com/Claw323/notepadmd-plus"
+
+[dependencies]
+arboard = "3.6.1"
+# glow renderer instead of default wgpu: much smaller binary, fine for this UI
+eframe = { version = "0.35", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "persistence",
+] }
+# direct dep only to re-enable winit's default windowing backends,
+# which eframe turns off when built with default-features = false
+winit = "0.30"
+egui = "0.35"
+egui_commonmark = { version = "0.24.0", features = ["better_syntax_highlighting"] }
+rfd = "0.17.2"
+serde = { version = "1.0.228", features = ["derive"] }
+
+[build-dependencies]
+winresource = "0.1.31"
+
+# Patched so code blocks in the preview are selectable Labels that join
+# egui's cross-label text selection (select across prose + code, copy once).
+# See vendor/egui_commonmark_backend/src/elements.rs `code_block`.
+[patch.crates-io]
+egui_commonmark_backend = { path = "vendor/egui_commonmark_backend" }
+
+# Small, fast single-file release binary.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
