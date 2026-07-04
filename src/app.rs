@@ -45,6 +45,7 @@ enum StartupMode {
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct Prefs {
     theme: ThemePref,
     word_wrap: bool,
@@ -52,6 +53,7 @@ struct Prefs {
     startup_mode: StartupMode,
     remember_recent: bool,
     last_mode: Mode,
+    sync_scroll: bool,
 }
 
 impl Default for Prefs {
@@ -63,6 +65,7 @@ impl Default for Prefs {
             startup_mode: StartupMode::LastUsed,
             remember_recent: true,
             last_mode: Mode::Plain,
+            sync_scroll: true,
         }
     }
 }
@@ -143,6 +146,15 @@ pub struct App {
     // so the editor — which renders before the menus — actually receives them
     pending_editor_events: Vec<egui::Event>,
 
+    // split-view synchronized scrolling: (offset, content height, viewport height)
+    editor_scroll_info: (f32, f32, f32),
+    preview_scroll_info: (f32, f32, f32),
+    prev_editor_offset: f32,
+    prev_preview_offset: f32,
+    pending_editor_offset: Option<f32>,
+    pending_preview_offset: Option<f32>,
+    preview_layer: Option<egui::LayerId>,
+
     // disk change watching
     disk_mtime: Option<SystemTime>,
     last_disk_check: Instant,
@@ -200,6 +212,13 @@ impl App {
             menu_rect: egui::Rect::NOTHING,
             menu_rows: Vec::new(),
             pending_menu_click: None,
+            editor_scroll_info: (0.0, 0.0, 0.0),
+            preview_scroll_info: (0.0, 0.0, 0.0),
+            prev_editor_offset: 0.0,
+            prev_preview_offset: 0.0,
+            pending_editor_offset: None,
+            pending_preview_offset: None,
+            preview_layer: None,
             preview_rect: egui::Rect::NOTHING,
             editor_rect: egui::Rect::NOTHING,
             pending_editor_events: Vec::new(),
@@ -561,6 +580,7 @@ impl App {
                 ui.separator();
                 ui.checkbox(&mut self.prefs.word_wrap, "Word Wrap\tAlt+Z");
                 ui.checkbox(&mut self.prefs.line_numbers, "Line Numbers");
+                ui.checkbox(&mut self.prefs.sync_scroll, "Synchronized Scrolling (Split)");
                 ui.separator();
                 if ui.button("Zoom In\tCtrl+Plus").clicked() {
                     ctx.set_zoom_factor(ctx.zoom_factor() * 1.1);
@@ -627,6 +647,9 @@ impl App {
                     self.mode = m;
                 }
             }
+            if self.mode == Mode::Split {
+                ui.checkbox(&mut self.prefs.sync_scroll, "Sync scroll");
+            }
             ui.separator();
             if ui.button("Find").clicked() {
                 self.open_find(false);
@@ -685,11 +708,14 @@ impl App {
             ui.ctx().fonts_mut(|f| f.layout_job(job))
         };
 
-        let scroll = if wrap { egui::ScrollArea::vertical() } else { egui::ScrollArea::both() };
+        let mut scroll = if wrap { egui::ScrollArea::vertical() } else { egui::ScrollArea::both() };
+        if let Some(o) = self.pending_editor_offset.take() {
+            scroll = scroll.vertical_scroll_offset(o);
+        }
         // explicit ids: in split view ui.columns gives both columns the same
         // stable id, so unsalted ScrollAreas collide and clobber each other's
         // scroll state (preview side becomes unscrollable)
-        scroll.id_salt("editor-scroll").auto_shrink([false, false]).show(ui, |ui| {
+        let sout = scroll.id_salt("editor-scroll").auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 let gutter = if self.prefs.line_numbers {
                     let digits = self.text.lines().count().max(1).ilog10() as usize + 1;
@@ -754,6 +780,7 @@ impl App {
                 }
             });
         });
+        self.editor_scroll_info = (sout.state.offset.y, sout.content_size.y, sout.inner_rect.height());
         if self.text.is_empty() && self.path.is_none() {
             draw_empty_state(ui, self.editor_rect);
         }
@@ -761,7 +788,12 @@ impl App {
 
     fn preview_ui(&mut self, ui: &mut egui::Ui) {
         self.preview_rect = ui.max_rect();
-        egui::ScrollArea::vertical().id_salt("preview-scroll").auto_shrink([false, false]).show(ui, |ui| {
+        self.preview_layer = Some(ui.layer_id());
+        let mut scroll = egui::ScrollArea::vertical();
+        if let Some(o) = self.pending_preview_offset.take() {
+            scroll = scroll.vertical_scroll_offset(o);
+        }
+        let sout = scroll.id_salt("preview-scroll").auto_shrink([false, false]).show(ui, |ui| {
             highlight::reading_style(ui);
             // comfortable reading column
             let max_w = 860.0_f32.min(ui.available_width());
@@ -774,6 +806,7 @@ impl App {
                     CommonMarkViewer::new().show(ui, &mut self.md_cache, &shown);
                 });
         });
+        self.preview_scroll_info = (sout.state.offset.y, sout.content_size.y, sout.inner_rect.height());
         if self.text.is_empty() && self.path.is_none() {
             draw_empty_state(ui, self.preview_rect);
         }
@@ -806,6 +839,100 @@ impl App {
                 }
             });
         });
+    }
+
+    /// Mirror the editor's selection into the preview (split view + sync on):
+    /// strip Markdown syntax from the selected source, then find and tint the
+    /// matching rendered text by scanning this frame's painted galleys.
+    /// Paint-only — it never affects what a copy on either side produces.
+    fn mirror_selection(&self, ctx: &egui::Context) {
+        if !(self.prefs.sync_scroll && self.mode == Mode::Split) {
+            return;
+        }
+        let Some(r) = self.cursor_char_range(ctx) else { return };
+        let (a, b) = (r.primary.index.0.min(r.secondary.index.0), r.primary.index.0.max(r.secondary.index.0));
+        if a == b {
+            return;
+        }
+        let (ba, bb) = (char_to_byte(&self.text, a), char_to_byte(&self.text, b));
+        let selected = &self.text[ba..bb.min(ba + 4000)]; // cap for perf
+        let needle = strip_md(selected);
+        let segments: Vec<Vec<char>> = needle
+            .split('\n')
+            .map(|s| s.trim().chars().collect::<Vec<_>>())
+            .filter(|s: &Vec<char>| s.len() >= 2)
+            .collect();
+        if segments.is_empty() {
+            return;
+        }
+        let Some(layer) = self.preview_layer else { return };
+
+        // Collect the preview's galleys in paint (reading) order and flatten
+        // them into one char stream; galley boundaries count as whitespace.
+        let mut toks: Vec<(egui::Pos2, std::sync::Arc<egui::Galley>)> = Vec::new();
+        ctx.graphics(|g| {
+            if let Some(list) = g.get(layer) {
+                for cs in list.all_entries() {
+                    if let egui::epaint::Shape::Text(ts) = &cs.shape {
+                        let rect = egui::Rect::from_min_size(ts.pos, ts.galley.size());
+                        if rect.intersects(self.preview_rect) && ts.pos.x >= self.preview_rect.left() - 2.0 {
+                            toks.push((ts.pos, ts.galley.clone()));
+                        }
+                    }
+                }
+            }
+        });
+        let mut flat: Vec<char> = Vec::new();
+        let mut map: Vec<(usize, usize)> = Vec::new(); // flat idx -> (tok, char-in-galley)
+        for (ti, (_, g)) in toks.iter().enumerate() {
+            for (ci, ch) in g.text().chars().enumerate() {
+                flat.push(ch);
+                map.push((ti, ci));
+            }
+            flat.push(' '); // boundary
+            map.push((usize::MAX, 0));
+            if flat.len() > 200_000 {
+                break;
+            }
+        }
+
+        // match each selected paragraph in order, then tint the matched rows
+        let color = ctx.global_style().visuals.selection.bg_fill.gamma_multiply(0.4);
+        let painter = egui::Painter::new(ctx.clone(), layer, self.preview_rect);
+        let mut from = 0;
+        for seg in &segments {
+            let Some((s, e)) = find_tolerant(&flat, seg, from) else { continue };
+            from = e;
+            // group matched flat range by galley
+            let mut by_tok: Vec<(usize, usize, usize)> = Vec::new(); // tok, first, last+1
+            for &(ti, ci) in &map[s..e] {
+                if ti == usize::MAX {
+                    continue;
+                }
+                match by_tok.last_mut() {
+                    Some((t, _, hi)) if *t == ti => *hi = ci + 1,
+                    _ => by_tok.push((ti, ci, ci + 1)),
+                }
+            }
+            for (ti, ca, cb) in by_tok {
+                let (pos, galley) = &toks[ti];
+                let mut cum = 0usize;
+                for placed in &galley.rows {
+                    let n = placed.char_count_including_newline().0;
+                    let (lo, hi) = (ca.max(cum), cb.min(cum + n));
+                    if lo < hi {
+                        let x0 = placed.x_offset(egui::epaint::text::CharIndex(lo - cum));
+                        let x1 = placed.x_offset(egui::epaint::text::CharIndex(hi - cum));
+                        let rect = egui::Rect::from_min_max(
+                            *pos + placed.pos.to_vec2() + egui::vec2(x0, 0.0),
+                            *pos + placed.pos.to_vec2() + egui::vec2(x1, placed.row.height()),
+                        );
+                        painter.rect_filled(rect, 2.0, color);
+                    }
+                    cum += n;
+                }
+            }
+        }
     }
 
     fn run_menu_action(&mut self, action: MenuAction, ctx: &egui::Context) {
@@ -1268,6 +1395,38 @@ impl eframe::App for App {
             }
         }
 
+        // Synchronized scrolling in split view: whichever pane the cursor is
+        // over drives the other to the same relative position.
+        if self.prefs.sync_scroll && self.mode == Mode::Split {
+            let (eo, ec, ev) = self.editor_scroll_info;
+            let (po, pc, pv) = self.preview_scroll_info;
+            let e_moved = (eo - self.prev_editor_offset).abs() > 0.5;
+            let p_moved = (po - self.prev_preview_offset).abs() > 0.5;
+            let ptr = ctx.input(|i| i.pointer.hover_pos());
+            let in_preview = ptr.is_some_and(|p| self.preview_rect.contains(p));
+            let drive_preview = e_moved && !in_preview;
+            let drive_editor = p_moved && in_preview;
+            if drive_preview {
+                let frac = eo / (ec - ev).max(1.0);
+                let target = (frac * (pc - pv).max(0.0)).max(0.0);
+                self.pending_preview_offset = Some(target);
+                self.prev_preview_offset = target; // don't echo back next frame
+            } else {
+                self.prev_preview_offset = po;
+            }
+            if drive_editor {
+                let frac = po / (pc - pv).max(1.0);
+                let target = (frac * (ec - ev).max(0.0)).max(0.0);
+                self.pending_editor_offset = Some(target);
+                self.prev_editor_offset = target;
+            } else {
+                self.prev_editor_offset = eo;
+            }
+        } else {
+            self.prev_editor_offset = self.editor_scroll_info.0;
+            self.prev_preview_offset = self.preview_scroll_info.0;
+        }
+
         self.handle_shortcuts(ctx);
         self.update_title(ctx);
         self.prefs.last_mode = self.mode;
@@ -1292,6 +1451,7 @@ impl eframe::App for App {
                 }
             });
 
+        self.mirror_selection(ctx);
         self.context_menu(ctx);
         self.modals(ctx);
     }
@@ -1490,6 +1650,110 @@ fn lift_nested_fences(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// Reduce Markdown source to roughly what the renderer displays: strip
+/// emphasis/code markers, heading/quote/list prefixes, link URLs; paragraph
+/// breaks become '\n', soft line breaks a space. Fenced code is kept verbatim.
+fn strip_md(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut in_fence = false;
+    for line in src.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            out.push_str(line);
+            out.push(' ');
+            continue;
+        }
+        if trimmed.is_empty() {
+            if !out.is_empty() && !out.ends_with('\n') {
+                while out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push('\n');
+            }
+            continue;
+        }
+        let mut t = trimmed;
+        // heading / quote / list / task prefixes
+        let hashes = t.chars().take_while(|&c| c == '#').count();
+        if hashes > 0 && t[hashes..].starts_with(' ') {
+            t = t[hashes + 1..].trim_start();
+        }
+        while let Some(rest) = t.strip_prefix('>') {
+            t = rest.trim_start();
+        }
+        if let Some(n) = crate::highlight::list_marker_len(t) {
+            t = &t[n..];
+        }
+        // inline markers
+        let mut chars = t.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '*' | '_' | '`' | '~' => {}
+                '!' if chars.peek() == Some(&'[') => {}
+                ']' => {
+                    // drop "(url)" after a link/image text
+                    if chars.peek() == Some(&'(') {
+                        for c2 in chars.by_ref() {
+                            if c2 == ')' {
+                                break;
+                            }
+                        }
+                    }
+                }
+                '[' => {}
+                _ => out.push(c),
+            }
+        }
+        out.push(' '); // soft break
+    }
+    while out.ends_with(' ') || out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Find `needle` in `hay` starting at `from`, treating any whitespace run
+/// (including none on the hay side at galley boundaries) as equivalent.
+/// Returns the matched hay range.
+fn find_tolerant(hay: &[char], needle: &[char], from: usize) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return None;
+    }
+    'outer: for start in from..hay.len() {
+        if hay[start].is_whitespace() {
+            continue;
+        }
+        let (mut i, mut j) = (start, 0);
+        while j < needle.len() {
+            if needle[j].is_whitespace() {
+                while j < needle.len() && needle[j].is_whitespace() {
+                    j += 1;
+                }
+                while i < hay.len() && hay[i].is_whitespace() {
+                    i += 1;
+                }
+                continue;
+            }
+            if i < hay.len() && hay[i].is_whitespace() {
+                i += 1;
+                continue;
+            }
+            if i < hay.len() && hay[i] == needle[j] {
+                i += 1;
+                j += 1;
+            } else {
+                continue 'outer;
+            }
+        }
+        return Some((start, i));
+    }
+    None
+}
+
 fn char_to_byte(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
 }
@@ -1553,6 +1817,30 @@ mod tests {
         // unclosed fence runs to EOF without panicking
         let unclosed = "1. a\n   ```\n   code";
         assert_eq!(lift_nested_fences(unclosed), "1. a\n\n```\ncode");
+    }
+
+    #[test]
+    fn strip_md_matches_rendered_text() {
+        let src = "## Head\n\n2. **Back up** the `DB` now:\n> quoted *text*\n\nSee [docs](http://x) here.";
+        assert_eq!(
+            strip_md(src),
+            "Head\nBack up the DB now: quoted text\nSee docs here."
+        );
+        // fenced code kept verbatim
+        assert_eq!(strip_md("```rs\nlet x = 1;\n```"), "let x = 1;");
+    }
+
+    #[test]
+    fn tolerant_find() {
+        let hay: Vec<char> = "Back up  every SQLite DB using".chars().collect();
+        let needle: Vec<char> = "up every SQLite".chars().collect();
+        let (s, e) = find_tolerant(&hay, &needle, 0).unwrap();
+        assert_eq!(hay[s..e].iter().collect::<String>(), "up  every SQLite");
+        // hay-side extra whitespace (galley boundaries) is tolerated
+        let hay2: Vec<char> = "bold text".chars().collect();
+        let needle2: Vec<char> = "boldtext".chars().collect();
+        assert!(find_tolerant(&hay2, &needle2, 0).is_some());
+        assert!(find_tolerant(&hay, &"missing".chars().collect::<Vec<_>>(), 0).is_none());
     }
 
     #[test]

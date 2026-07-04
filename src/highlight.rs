@@ -117,7 +117,7 @@ fn is_hr(t: &str) -> bool {
 
 /// Length of a leading list marker ("- ", "* ", "+ ", "12. ", including indent
 /// and task-list checkbox), or None.
-fn list_marker_len(line: &str) -> Option<usize> {
+pub(crate) fn list_marker_len(line: &str) -> Option<usize> {
     let indent = line.len() - line.trim_start().len();
     let t = &line[indent..];
     let after = if let Some(r) = t.strip_prefix("- ").or(t.strip_prefix("* ")).or(t.strip_prefix("+ ")) {
